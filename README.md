@@ -43,6 +43,10 @@ and this repo is meant to save you the incidents we learned them from.
 - `SKILL.md` — the `chain-compile` skill: the elicitation questions to ask
   about a target API, the compile procedure, the output format, a self-check,
   and refusal conditions (when a chain is the wrong abstraction).
+- `CONFORMANCE.md` — behaviors any implementation must satisfy (idempotent
+  replay produces one booking, expired TTL forces re-price, budget exhaustion
+  emits dead-end with full trace, …). This is the acceptance test suite for a
+  runtime and the honesty check for the repo.
 
 The runtime implementation is intentionally out of scope; the spec is
 language-agnostic and written to be implemented from.
@@ -77,8 +81,9 @@ commit-safety questions is marked BLOCKED by the skill, not silently guessed.
 
 **4. Implement from the config.** Hand the reviewed config plus `SPEC.md`'s
 semantics (§3 verdict transitions, §4 invalidation rules) to your
-implementation — human or coding agent — as the contract. The trace format
-(§2.5) doubles as your eval/replay substrate.
+implementation — human or coding agent — as the contract, with
+`CONFORMANCE.md` as the acceptance suite. The trace format (§2.5) doubles as
+your eval/replay substrate.
 
 **5. Respect the refusal conditions.** The skill refuses when a chain is
 overkill (single call, fully idempotent CRUD, provider already runs the state

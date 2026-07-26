@@ -2,7 +2,7 @@
 
 Created: 2026-07-27
 Last Updated: 2026-07-27
-Status: Draft v0.2 (pre-implementation)
+Status: Draft v0.2.1 (pre-implementation)
 
 A domain-agnostic model for multi-step API chains where later steps mutate
 external state, intermediate results expire, and "nothing available" is a valid
@@ -131,11 +131,16 @@ action:
     empty:                        # only for actions where empty is valid
       valid: bool
       detect: <payload predicate> # e.g. "results.length == 0"
-      route: <verdict>            # what ok(empty) maps to; usually gate or repair
+      route: <verdict>            # ok | gate | repair | dead_end — what
+                                  # ok(empty) maps to; `ok` = proceed to the
+                                  # next step degraded (e.g. no seat map →
+                                  # book seatless), recorded in the trace
 
   preconditions:                  # payload-level business blockers on ok results
     - when: <payload predicate>   # e.g. "no ticket with EXCHANGEABLE_BY_OBT"
-      verdict: <gate|dead_end|repair(...)>
+      verdict: <ok|gate|dead_end|repair(...)>   # ok = matched but proceed
+                                  # degraded (skip the dependent capability),
+                                  # recorded in the trace
       reason: string
   # Evaluated after ok, before advancing. Distinct from `empty`: the call
   # succeeded and returned data — the data says the business action is blocked.
@@ -257,6 +262,14 @@ Notes:
 
 All values are static config. None may be model-decided (P1).
 
+> **OPEN — deliberately unsettled.** The default attempt counts below and the
+> retry→rewind escalation threshold (when same-step retry stops being worth it
+> and the run should rewind/replan instead) are provisional placeholders. They
+> must be calibrated against a real production error corpus — which signal
+> classes actually recover on same-step retry vs require rewind — not decided
+> in the abstract. Treat the *shape* of the policy as normative and the
+> *numbers* as unreviewed defaults. See §8.
+
 ```yaml
 policy:
   per_step:                       # overridable per action
@@ -270,7 +283,9 @@ policy:
     max_rewinds: int              # total rewind+repair budget for the run
     max_repairs: int              # subset cap: repairs need model/user round-trips
     wall_clock: duration          # whole-run budget, excludes time parked at gates
-    gate_timeout: duration        # per gate; on expiry → gate's declared timeout verdict
+    gate_timeout: duration        # default for gates that omit their own
+                                  # timeout; a gate's timeout.after takes
+                                  # precedence over this chain-level value
   escalation:                     # who may be asked what, in order
     - {audience: model,    may: [propose repair fields, choose among returned options]}
     - {audience: user,     may: [answer consent gates, approve repairs with cost]}
@@ -282,6 +297,13 @@ policy:
 One record per attempt, append-only, plus a resumable run snapshot. Traces are
 eval-grade: they must let you re-derive every decision without the original
 process.
+
+> **OPEN — deliberately unsettled.** The *field semantics* below are
+> normative: what must be captured, and the invariants at the end of this
+> section. The *exact serialization* — JSON shape, field naming, encoding,
+> storage layout — is intentionally unpinned; the examples are illustrative
+> only. Pin it when the eval tooling and the real error corpus exist to
+> validate it against, not before. See §8.
 
 ```json
 // attempt record
@@ -347,6 +369,11 @@ choice (a cancellation option, an alternate seat) binds into intent fields
 and typically rides a `repair`. `outcome_name: verdict` is a valid shorthand
 when there are no params.
 
+An outcome verdict of `ok` means the raising step's original success path
+stands: the run advances past the step that raised the gate, using that
+step's already-produced output. It never re-executes the raising step — use
+`rewind` in the outcome if re-execution is what you mean.
+
 ---
 
 ## 3. Verdict decision table
@@ -382,10 +409,13 @@ Rules:
 ```
 ok           → evaluate `preconditions`; first match → its verdict; else
                advance cursor to next step; if last step → done
-ok(empty)    → follow empty.route (gate | repair | dead_end)
+ok(empty)    → follow empty.route (ok | gate | repair | dead_end;
+               ok = advance degraded)
 retry        → same step after backoff; attempts exhausted → escalate per
                effect class: read/mint → rewind(refresh of newest input
                handle) if rewinds remain, else dead_end; keyed commit → dead_end
+               (the exhaustion→rewind threshold is OPEN — calibrate against
+               the production error corpus, see §2.4 and §8)
 rewind(to)   → decrement rewind budget; invalidate per §4; cursor = to;
                when replay re-crosses a selection pseudo-step, apply its
                `rematch` spec (exact key match → code re-selects; else per
@@ -819,6 +849,16 @@ distributed transactions; provider rate-limit budgeting across concurrent
 runs; streaming/partial results.
 
 Open questions:
+- **OPEN (held back deliberately): the retry-vs-replan threshold.** Default
+  attempt counts and the retry-exhaustion→rewind escalation rule are
+  placeholders. Settle them against the real production error corpus (per
+  signal class: observed recovery rate on same-step retry vs after rewind),
+  not in the abstract. Until then, implementations treat §2.4's numbers as
+  config to be tuned, and conformance tests parameterize over them.
+- **OPEN (held back deliberately): trace serialization.** §2.5's field
+  semantics and invariants are normative; the exact wire format is not.
+  Decide it when eval tooling consumes real traces, so the format is
+  validated by use rather than speculation.
 - Should `gate` outcomes be allowed to carry model-proposed defaults ("auto-
   accept price increases under $5")? Current answer: no — thresholded
   auto-consent is a *policy* field if a product wants it, still deterministic.
@@ -831,6 +871,15 @@ Open questions:
 
 ## Changelog
 
+- **v0.2.1 (2026-07-27)** — round-2 grammar fixes: `ok` allowed in
+  `empty.route` and `preconditions.verdict` (proceed-degraded, resolving a
+  self-contradiction with example A's seat_map); gate outcome `ok` semantics
+  stated (raising step's success path stands, never re-executes); gate
+  timeout precedence stated (per-gate wins over `per_chain.gate_timeout`).
+  Deliberately marked OPEN, to be settled against the real production error
+  corpus rather than in the abstract: the retry-vs-replan escalation
+  threshold (§2.4) and the trace serialization format (§2.5). Added
+  `CONFORMANCE.md` — implementation-agnostic behavioral requirements.
 - **v0.2 (2026-07-27)** — amendments driven by the blind-compile verification
   (compile the Spotnana air chain from spec+skill+API docs only, compare
   against a production implementation; verification artifacts cite production
