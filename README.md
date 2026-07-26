@@ -73,23 +73,24 @@ Keep `SPEC.md` next to it (or vendored in-repo) — the skill references it.
   Optionally add a line to your `AGENTS.md` telling Codex to compile a chain
   config before building any multi-step API client.
 
-- **Devin** — create a [Playbook](https://docs.devin.ai/product-guides/creating-playbooks)
-  from `SKILL.md` (it already has the Playbook shape: steps, output format,
-  definition of done, refusal guardrails), and add `SPEC.md`'s principles
-  P1–P6 as Knowledge (Settings & Library → Knowledge) so they're recalled in
-  every session, not just Playbook runs.
-
-- **OpenHands** (formerly OpenDevin) — repo-scoped skill/microagent:
+- **GitHub Copilot** — [officially supports Agent Skills](https://docs.github.com/en/copilot/concepts/agents/about-agent-skills)
+  across the coding agent, Copilot CLI, and VS Code agent mode:
 
   ```
-  .openhands/skills/chain-compile/SKILL.md   # V1; V0: .openhands/microagents/chain-compile.md
+  .github/skills/chain-compile/SKILL.md      # or ~/.copilot/skills/...
   ```
 
-  Add frontmatter `triggers` (e.g. `booking`, `payment`, `api client`,
-  `saga`) so it loads when chain-shaped work comes up.
+  Copilot also picks up `.claude/skills/` automatically, so the Claude Code
+  placement above covers Copilot too.
 
-- **Anything else** — paste `SKILL.md` as the task prompt and attach
-  `SPEC.md`; the compile procedure is self-contained.
+- **Cursor** — add `SKILL.md` to the project and reference it from your
+  Cursor rules (e.g. a rule saying "before building a multi-step API client,
+  follow SKILL.md to compile a chain config"), or provide it directly as
+  agent context for the task.
+
+- **Anything else** (Devin, OpenHands, your own harness, …) — paste
+  `SKILL.md` as the task prompt and attach `SPEC.md`; the compile procedure
+  is self-contained.
 
 **2. Compile before you code.** When you're about to build a client/business
 layer for a multi-step API, invoke the skill with your API documentation (and
