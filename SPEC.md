@@ -833,8 +833,8 @@ Open questions:
 
 - **v0.2 (2026-07-27)** — amendments driven by the blind-compile verification
   (compile the Spotnana air chain from spec+skill+API docs only, compare
-  against a production implementation; verification artifacts are maintained
-  in a private companion repo):
+  against a production implementation; verification artifacts cite production
+  internals and are kept out of this public repo):
   P3 correlation-record + cancellation-shield mechanics; external
   (planner-executed) rewind mode with typed `restart_required` signals;
   effect-class rubric (double-call test; returning a handle ≠ mint);

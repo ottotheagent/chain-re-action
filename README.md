@@ -24,5 +24,5 @@ to be implemented from, language-agnostic.
 The spec is validated by blind-compile verification: an agent seeing only
 SPEC+SKILL and a target API's documentation compiles a chain config, which is
 then compared against a production implementation of the same chain. Those
-verification artifacts cite production internals and live in a private
-companion repo.
+verification artifacts cite production internals and are kept out of this
+public repo (gitignored).
