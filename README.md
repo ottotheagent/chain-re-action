@@ -53,16 +53,43 @@ language-agnostic and written to be implemented from.
 
 ## How to use it
 
-**1. Install the skill for your coding agent.** For Claude Code: copy this
-repo (or add it as a submodule) and place `SKILL.md` where your agent
-discovers skills, e.g.
+**1. Install the skill for your coding agent.** The skill is plain markdown
+with YAML frontmatter, so it drops into any agent's discovery mechanism.
+Keep `SPEC.md` next to it (or vendored in-repo) — the skill references it.
 
-```
-.claude/skills/chain-compile/SKILL.md   # keep SPEC.md next to it or in-repo
-```
+- **Claude Code** — project or personal skills directory:
 
-Any agent framework works the same way — the skill is plain markdown
-instructions that reference `SPEC.md`.
+  ```
+  .claude/skills/chain-compile/SKILL.md      # or ~/.claude/skills/...
+  ```
+
+- **OpenAI Codex** — Codex discovers `SKILL.md` skills the same way; invoke
+  with `$chain-compile` or let it auto-activate on match:
+
+  ```
+  .codex/skills/chain-compile/SKILL.md       # or ~/.codex/skills/...
+  ```
+
+  Optionally add a line to your `AGENTS.md` telling Codex to compile a chain
+  config before building any multi-step API client.
+
+- **Devin** — create a [Playbook](https://docs.devin.ai/product-guides/creating-playbooks)
+  from `SKILL.md` (it already has the Playbook shape: steps, output format,
+  definition of done, refusal guardrails), and add `SPEC.md`'s principles
+  P1–P6 as Knowledge (Settings & Library → Knowledge) so they're recalled in
+  every session, not just Playbook runs.
+
+- **OpenHands** (formerly OpenDevin) — repo-scoped skill/microagent:
+
+  ```
+  .openhands/skills/chain-compile/SKILL.md   # V1; V0: .openhands/microagents/chain-compile.md
+  ```
+
+  Add frontmatter `triggers` (e.g. `booking`, `payment`, `api client`,
+  `saga`) so it loads when chain-shaped work comes up.
+
+- **Anything else** — paste `SKILL.md` as the task prompt and attach
+  `SPEC.md`; the compile procedure is self-contained.
 
 **2. Compile before you code.** When you're about to build a client/business
 layer for a multi-step API, invoke the skill with your API documentation (and
