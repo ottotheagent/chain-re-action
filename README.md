@@ -4,25 +4,88 @@ Created: 2026-07-27
 Last Updated: 2026-07-27
 
 A spec + skill for making multi-step stateful API chains (search → price →
-hold → commit) recoverable, bounded, and replayable — and for teaching coding
-agents to COMPILE a chain config for a new domain instead of improvising
-retry/recovery logic at runtime.
+hold → commit) **recoverable, bounded, and replayable** — and for teaching
+coding agents to COMPILE a chain config for a new domain instead of
+improvising retry/recovery logic at runtime.
 
-Ground truth: Otto's Spotnana air booking integration (expiring opaque
-handles, no idempotency key on the commit, coupled round-trip sub-searches,
-webhook finality) and Booking.com-style hotel flows.
+## Where this comes from
+
+This distills the learning experience of building
+[Otto](https://ottotheagent.com), an AI business travel agent, whose core is
+exactly this problem: long chains of supplier API calls where later steps
+mutate real-world state (tickets, payments), intermediate results expire
+underneath you, "nothing available" is a valid answer rather than an error,
+and the most dangerous failure is the one whose outcome you never learned
+(a commit whose response was lost). The hard-won details are baked into the
+spec as first-class concepts:
+
+- expiring opaque handles at every hop, where expiry is *discovered on use*,
+  never scheduled by timer
+- commits with **no idempotency key**, forcing attempts=1 plus
+  confirm-don't-guess reconciliation
+- results that are valid only relative to an earlier selection (coupled
+  sub-searches), where mixing lineages silently corrupts data
+- compensation that is a business action with fees and windows, not a rollback
+- the LLM/deterministic boundary: the model chooses among options and proposes
+  intent repairs; code owns budgets, backoff, sequencing, handles, and stop
+  conditions
+
+If you're building an agentic application on top of any stateful supplier API
+— travel, payments, provisioning, logistics — these are the same problems,
+and this repo is meant to save you the incidents we learned them from.
+
+## What's here
 
 - `SPEC.md` — the data model (Action, Handle, Verdict, Policy, Gate, Trace),
   the verdict decision table, state-invalidation rules, and two worked
-  examples (Spotnana air; card payment capture).
-- `SKILL.md` — the `chain-compile` skill: elicitation questions, compile
-  procedure, output format, self-check, and refusal conditions.
+  examples with deliberately different failure shapes (a flight booking
+  chain; a card payment capture chain).
+- `SKILL.md` — the `chain-compile` skill: the elicitation questions to ask
+  about a target API, the compile procedure, the output format, a self-check,
+  and refusal conditions (when a chain is the wrong abstraction).
 
-The runtime implementation is intentionally out of scope; the spec is written
-to be implemented from, language-agnostic.
+The runtime implementation is intentionally out of scope; the spec is
+language-agnostic and written to be implemented from.
+
+## How to use it
+
+**1. Install the skill for your coding agent.** For Claude Code: copy this
+repo (or add it as a submodule) and place `SKILL.md` where your agent
+discovers skills, e.g.
+
+```
+.claude/skills/chain-compile/SKILL.md   # keep SPEC.md next to it or in-repo
+```
+
+Any agent framework works the same way — the skill is plain markdown
+instructions that reference `SPEC.md`.
+
+**2. Compile before you code.** When you're about to build a client/business
+layer for a multi-step API, invoke the skill with your API documentation (and
+any empirical behavior notes — those are usually worth more than the official
+docs). The agent interviews the docs with the skill's elicitation questions
+and produces a **chain config**: handle graph, per-action effect
+classification, verdict table, gates, policy, invalidation walkthroughs, and
+— critically — an explicit UNKNOWNs list with every assumption tagged by
+evidence source.
+
+**3. Review the compile output as a design document.** The UNKNOWNs section
+is the point: each item is a question to put to the API owner before
+implementation (e.g. "is there an idempotency key?" — the single
+highest-leverage question for any commit). A config with unanswered
+commit-safety questions is marked BLOCKED by the skill, not silently guessed.
+
+**4. Implement from the config.** Hand the reviewed config plus `SPEC.md`'s
+semantics (§3 verdict transitions, §4 invalidation rules) to your
+implementation — human or coding agent — as the contract. The trace format
+(§2.5) doubles as your eval/replay substrate.
+
+**5. Respect the refusal conditions.** The skill refuses when a chain is
+overkill (single call, fully idempotent CRUD, provider already runs the state
+machine) — if it says "use a retry wrapper," believe it.
 
 The spec is validated by blind-compile verification: an agent seeing only
 SPEC+SKILL and a target API's documentation compiles a chain config, which is
-then compared against a production implementation of the same chain. Those
-verification artifacts cite production internals and are kept out of this
-public repo (gitignored).
+then compared dimension-by-dimension against Otto's production implementation
+of the same chain. Those verification artifacts cite production internals and
+are kept out of this public repo (gitignored).
