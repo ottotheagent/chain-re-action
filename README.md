@@ -20,3 +20,9 @@ webhook finality) and Booking.com-style hotel flows.
 
 The runtime implementation is intentionally out of scope; the spec is written
 to be implemented from, language-agnostic.
+
+The spec is validated by blind-compile verification: an agent seeing only
+SPEC+SKILL and a target API's documentation compiles a chain config, which is
+then compared against a production implementation of the same chain. Those
+verification artifacts cite production internals and live in a private
+companion repo.

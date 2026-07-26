@@ -57,6 +57,10 @@ each answer (`documented` / `observed` / `assumed`). Ask, per candidate step:
 2. If the process dies mid-call — request sent, response never read — what
    might exist? Can it cost money, hold inventory, or be user-visible?
    (yes → commit, and Q3 becomes mandatory)
+   2b. Does this commit create a NEW durable object, or MUTATE an existing
+   one in place? In-place → set `mutates`; confirmation must compare CONTENT
+   (existence proves nothing); and if no undo exists, name the pre-commit
+   safety gate.
 3. How would you find out whether an ambiguous attempt landed? Which read
    endpoint, filtered how? Is there a lag before it's queryable? Is there a
    webhook, and what's its worst-case delay?
@@ -78,11 +82,18 @@ each answer (`documented` / `observed` / `assumed`). Ask, per candidate step:
    (coupling)? E.g. prices valid only for a selected option, quotes tied to a
    session. These become `derived_from` edges — probe hard, this is where
    silent corruption lives.
+   8b. For every point where the model/user selects among returned options:
+   which intent-level fields stably identify "the same option" across a
+   re-search? (Provider option ids usually are NOT stable.) These become the
+   selection pseudo-handle's `rematch.key`.
 
 **Empty vs error**
 9. Can this call succeed with "nothing available / declined / no capacity"?
    How does that look in the payload (NOT the status code)? What should the
    run do next — which intent fields could a user plausibly change?
+   9b. Do the docs prescribe a deterministic fallback ("retry without filters
+   before reporting no availability")? These compile to `auto_repairs`
+   (proposal_source: code), not model repairs.
 
 **Failure taxonomy**
 10. List every documented error code for this endpoint. For each: is it
@@ -91,7 +102,10 @@ each answer (`documented` / `observed` / `assumed`). Ask, per candidate step:
     is wrong" vs "the provider is down"?
 11. Are there mid-chain events that require a HUMAN decision by business
     rule, not by failure — price/terms changed, challenge required, approval
-    needed? These become gates, never error handling.
+    needed? These become gates, never error handling. Also: which read
+    payloads encode business blockers (eligibility flags, status fields) even
+    though the call succeeded? These become `preconditions` — not `empty`,
+    not error handling.
 
 **Compensation**
 12. For each commit: what business action undoes it? What does undoing cost,
@@ -116,6 +130,10 @@ each answer (`documented` / `observed` / `assumed`). Ask, per candidate step:
   for each handle pair (A, B) with no edge, ask "if A is re-minted, is B
   really still valid?" Missing edges are the classic bug.
 - Mark `single_use` handles (consumed/spent by a commit — SPEC I4).
+- Every selection pseudo-handle needs a `rematch` spec (Q8b): the composite
+  intent-level key code uses to re-establish the selection after a rewind,
+  plus `on_ambiguous` routing. Without it, rewind-through-a-selection is
+  unimplementable.
 - Every handle gets `staleness.detect` from Q6. A handle with an empty
   `detect` list must be either durable (never expires) or flagged `UNKNOWN:
   staleness undetectable` — which makes every consumer's stale-handle row
@@ -134,6 +152,14 @@ For each step, emit the full Action record (SPEC §2.1). Non-negotiables:
   (probe + signal + async deadline). If Q3 had no answer, stop: BLOCKED.
 - `empty` block on every step where Q9 said yes, with a concrete
   `route` — usually `repair` listing the intent fields from Q9.
+- In-place commits (Q2b): set `mutates`, a content-based confirmation signal,
+  and an explicit compensation stance (`none` requires the pre-commit gate
+  named in `ordering_note`).
+- Unkeyed commits inherit the P3 mechanics: correlation record persisted
+  before dispatch + cancellation shield. Say WHERE the record lives — it must
+  survive process death.
+- Q11 business blockers → `preconditions`; Q9b prescribed fallbacks →
+  `auto_repairs`.
 
 ## Step 4 — Author the verdict table
 
@@ -147,7 +173,12 @@ Start from the generic skeleton (SPEC §3) and prepend domain rows:
 - Human-decision events (Q11) → `gate(...)` with declared outcomes, audience,
   and timeout verdict. Consent about money is `audience: user`, never model.
 - Deterministic provider rejects → `dead_end`. Resist the urge to retry
-  things that are documented to fail identically.
+  things that are documented to fail identically. Structure every `dead_end`
+  reason: `permanent: bool`, and a `retry_after_hint` for business-timescale
+  blocks (airline control, in-progress ticketing) so the planner can
+  re-attempt as a NEW run later.
+- Payload preconditions (Q11) get their own rows evaluated on ok results —
+  don't fold eligibility blocks into `empty`.
 - Ambiguous transport failure on a commit: `retry` iff keyed (same key),
   `reconcile` iff unkeyed. This single row is where double-charges come from;
   get it right.
@@ -171,6 +202,10 @@ Set `timeout` per step from Q14 worst-case, not average. The slowest step is
 usually the commit; give it headroom rather than letting a tight timeout
 manufacture ambiguous outcomes.
 
+Budgets are config, enforced by code — never prompt text. If the executor is
+a planner loop (external mode, SPEC §2.3), budgets ride in the durable run
+snapshot and continuation runs decrement the same counters.
+
 ## Step 6 — Emit
 
 Produce ONE document with these sections, in order:
@@ -178,27 +213,35 @@ Produce ONE document with these sections, in order:
 1. **Chain summary** — the business outcome, the step list, one paragraph.
 2. **Fit-test verdict** — why a chain is the right abstraction here (which
    properties fired: handles? expiry? commit? compensation?).
-3. **Handle graph** — YAML per SPEC §2.2 + a one-screen ASCII sketch of the
+3. **Elicitation log** — every Step-1 answer with its source tag
+   (`documented` / `observed` / `assumed`). This is the evidence trail
+   reviewers audit; a config without it is an assertion, not a compile.
+4. **Handle graph** — YAML per SPEC §2.2 + a one-screen ASCII sketch of the
    `derived_from` edges.
-4. **Actions** — YAML per SPEC §2.1, full field-level.
-5. **Verdict table** — domain rows, then a pointer to the generic skeleton;
+5. **Actions** — YAML per SPEC §2.1, full field-level.
+6. **Verdict table** — domain rows, then a pointer to the generic skeleton;
    `known_unmatched` list.
-6. **Gates** — YAML per SPEC §6.3 shape.
-7. **Policy** — YAML per SPEC §2.4.
-8. **Invalidation walkthrough** — pick the two most dangerous rewind/repair
+7. **Gates** — YAML per SPEC §2.6.
+8. **Policy** — YAML per SPEC §2.4.
+9. **Invalidation walkthrough** — pick the two most dangerous rewind/repair
    scenarios and trace exactly which handles/collections die (SPEC §4 rules
    applied by hand). If you can't produce this section, your `derived_from`
    edges are wrong.
-9. **UNKNOWNs & assumptions** — every `assumed`-sourced answer from Step 1,
-   every empty `staleness.detect`, every `compensation: none`. Each with the
-   question a human must answer before implementation.
-10. **Boundary recap** — a table of every point where the model participates
+10. **UNKNOWNs & assumptions** — every `assumed`-sourced answer from Step 1,
+    every empty `staleness.detect`, every `compensation: none`. Each with the
+    question a human must answer before implementation.
+11. **Boundary recap** — a table of every point where the model participates
     in THIS chain (selections, repair proposals, gate phrasing) proving each
     one is inside SPEC §5's allowances.
 
 ## Step 7 — Self-check before delivering
 
 - [ ] Every `commit` is keyed, or has `attempts: 1` AND a confirmation probe.
+- [ ] Every unkeyed commit has a correlation record persisted before dispatch
+      and a cancellation shield on the in-flight attempt (SPEC P3).
+- [ ] Every selection pseudo-handle has a `rematch` spec.
+- [ ] Every in-place commit (`mutates`) has a content-based confirmation
+      signal and an explicit compensation stance.
 - [ ] Every handle a commit consumes: either durable or has `staleness.detect`.
 - [ ] Every `single_use` handle is consumed by exactly one step.
 - [ ] Every model touchpoint is a selection, an intent-field repair proposal,
@@ -206,9 +249,11 @@ Produce ONE document with these sections, in order:
 - [ ] Every documented error code is mapped or listed in `known_unmatched`.
 - [ ] Every gate has an audience, all outcomes mapped to verdicts, a timeout.
 - [ ] Empty-result routes exist wherever Q9 said empty is valid.
-- [ ] The invalidation walkthrough (§8 of your output) is consistent with the
+- [ ] The invalidation walkthrough (§9 of your output) is consistent with the
       `derived_from` edges — trace it, don't assert it.
+- [ ] Payload business blockers are `preconditions`, not overloaded `empty`.
 - [ ] No TTL is used as an enforcement timer anywhere (hints only).
+- [ ] No budget or retry limit lives in prompt text.
 - [ ] Compensation ordering stated for any replace/rebook flow.
 
 Deliver the config. Implementation (runtime, client code) is a separate task

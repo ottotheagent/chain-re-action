@@ -2,7 +2,7 @@
 
 Created: 2026-07-27
 Last Updated: 2026-07-27
-Status: Draft v0.1 (pre-implementation)
+Status: Draft v0.2 (pre-implementation)
 
 A domain-agnostic model for multi-step API chains where later steps mutate
 external state, intermediate results expire, and "nothing available" is a valid
@@ -44,6 +44,9 @@ owns: step sequencing, attempt budgets, backoff, stop conditions, signal →
 verdict classification, handle values, invalidation, idempotency enforcement,
 and compensation execution. The model can never extend a budget, re-classify
 a signal the verdict table already matched, retry a commit, or touch a handle.
+Budgets live in config and are enforced by code — a budget stated in prompt
+text is not a budget. Config-declared deterministic fallbacks (`auto_repairs`,
+§2.1) count as code decisions even though they change intent fields.
 
 **P2 — Expiry is discovered, not scheduled.** Providers rarely expose handle
 TTLs, and observed lifetimes drift. Staleness is modeled as detection signals
@@ -55,6 +58,13 @@ on use (e.g. HTTP 410, `ITINERARY_FARE_EXPIRED`), plus an optional
 (timeout, connection drop) may have succeeded. The only safe next step is a
 **confirmation probe**, never a retry and never silent failure. Every
 commit-class Action MUST declare how to find out whether it landed.
+Two mechanics follow: (a) **correlation record** — before dispatching an
+unkeyed commit, persist a durable record of the attempt (run id, intent
+snapshot, status=PENDING) so out-of-band confirmation (webhook, sweep,
+operator) can correlate the provider's result back to this run even if the
+process dies; (b) **cancellation shield** — once a commit request is
+dispatched, the attempt runs to completion; caller timeouts or cancellation
+yield `reconcile`, never an abandoned in-flight commit.
 
 **P4 — Empty is an answer.** "No inventory", "no capacity", "card declined"
 are valid results with their own routing, distinct from transport or provider
@@ -83,15 +93,30 @@ action:
   description: string             # for humans and for the model's situational awareness
 
   effect: read | mint | commit | compensate
-  # read       — no external state change; free to repeat.
-  # mint       — creates expiring server-side state (a session, a hold, a
-  #              quote handle). Repeat-safe: worst case is orphaned state that
-  #              self-expires. Never billed, never user-visible.
-  # commit     — durable, externally visible mutation (PNR minted, payment
-  #              captured, VM created). Exactly-once semantics required.
+  # Classify by the DOUBLE-CALL TEST (what exists after calling twice) — never
+  # by the endpoint's name, and never by whether the call returns a handle.
+  # Reads may return handles to cached result state (a search_id) and remain
+  # reads; what makes a mint is dedicated mutable session state prepared for a
+  # later commit (a fare session, a hold).
+  # read       — repeating has no external consequence; free to repeat.
+  # mint       — repeating creates distinct expiring server-side artifacts you
+  #              must track (a session, a hold, a quote handle). Repeat-safe:
+  #              worst case is orphaned state that self-expires. Never billed,
+  #              never user-visible.
+  # commit     — durable, externally visible mutation. Exactly-once semantics
+  #              required. May CREATE a new object (PNR minted, payment
+  #              captured, VM created) or MUTATE an existing one in place
+  #              (modify-booking) — declare `mutates` for the latter.
   # compensate — business-level undo of a prior commit. Is itself
   #              commit-class: non-idempotent unless keyed, needs its own
   #              confirmation.
+
+  mutates: handle_id              # commit only, optional: this commit modifies
+                                  # an existing durable object in place instead
+                                  # of minting a new handle. output.handles may
+                                  # be empty; the confirmation signal MUST then
+                                  # be content-based (observe the mutated
+                                  # state), because existence proves nothing.
 
   input:
     intent:                       # model/user-repairable fields
@@ -107,6 +132,22 @@ action:
       valid: bool
       detect: <payload predicate> # e.g. "results.length == 0"
       route: <verdict>            # what ok(empty) maps to; usually gate or repair
+
+  preconditions:                  # payload-level business blockers on ok results
+    - when: <payload predicate>   # e.g. "no ticket with EXCHANGEABLE_BY_OBT"
+      verdict: <gate|dead_end|repair(...)>
+      reason: string
+  # Evaluated after ok, before advancing. Distinct from `empty`: the call
+  # succeeded and returned data — the data says the business action is blocked.
+
+  auto_repairs:                   # config-declared deterministic fallbacks
+    - trigger: <signal or payload predicate>
+      fields: <intent transform>  # e.g. "drop optional filters"
+      once: bool                  # default true: fire at most once per run
+  # When a trigger matches, the runtime issues repair(proposal_source: code)
+  # with the declared transform — no model round-trip. Counts against
+  # max_repairs. Use for provider-prescribed fallbacks ("retry without
+  # filters before reporting no availability").
 
   idempotency:
     mode: keyed | natural | none
@@ -126,6 +167,9 @@ action:
     async:                        # if finality arrives out-of-band
       channel: webhook | poll
       deadline: duration          # after which → escalate(operator)
+    sweep:                        # background reconciler for correlation
+      interval: duration          # records stuck PENDING (P3): re-probe each
+      escalate_after: duration    # interval; past escalate_after → operator
 
   compensation:                   # only meaningful for effect=commit
     action: action_id | none      # `none` must be explicit + justified in notes
@@ -143,6 +187,11 @@ Rules:
   **invalid config**. There is no safe behavior for its ambiguous failures.
 - `input.handles` values never appear in model-visible payloads except as
   opaque aliases (e.g. `flt_x7a2`), and the model can only echo aliases back.
+- Unkeyed commits REQUIRE the P3 mechanics: a correlation record persisted
+  before dispatch, and a cancellation shield on the in-flight attempt.
+- A commit with `mutates` and `compensation.action: none` MUST name its
+  pre-commit safety mechanism (usually a consent gate) in `ordering_note` —
+  when no undo exists, the protection has to sit before the commit.
 
 ### 2.2 Handle
 
@@ -152,6 +201,16 @@ handle:
   minted_by: action_id
   derived_from: [handle_id, ...]  # dependency edges; drives invalidation (§4)
   single_use: bool                # true if consuming it in a commit spends it
+  rematch:                        # selection pseudo-handles only (I3): how the
+    key: [intent-level fields]    # runtime re-establishes the selection after a
+                                  # rewind re-mints what it was derived from.
+                                  # Provider option ids are NOT stable across
+                                  # re-search; the key must be intent-level
+                                  # (carrier + flight numbers + times + fare
+                                  # basis — not itinerary_id).
+    on_ambiguous: model | gate    # exact key match → code re-selects silently;
+                                  # no/multiple matches → model re-selects (a
+                                  # new selection per I3), or gate to the user
   staleness:
     detect: [signal, ...]         # e.g. [http:410, code:ITINERARY_FARE_EXPIRED]
                                   # observed ON USE of this handle downstream
@@ -170,10 +229,10 @@ Exactly one verdict per attempt. Produced by the deterministic classifier
 | `ok` | Attempt succeeded; payload available. `ok(empty)` flags a valid empty result and follows the action's `empty.route`. | — |
 | `retry` | Same step, same inputs, after deterministic backoff. Only for transient transport/provider faults on non-commit steps (or keyed commits). | code |
 | `rewind(to: action_id)` | A handle died; re-execute from the cheapest step that re-mints it, then replay downstream. Inputs unchanged. | code |
-| `repair(to: action_id, fields: [...])` | Rewind that additionally requires a proposed change to named *intent* fields (new date, other payment instrument). The proposal comes from model or user; the rewind mechanics stay code-owned. | model/user propose, code executes |
+| `repair(to: action_id, fields: [...])` | Rewind that additionally requires a proposed change to named *intent* fields (new date, other payment instrument). The proposal comes from model, user, or a config-declared `auto_repair` (`proposal_source: code`); the rewind mechanics stay code-owned. | model/user/config propose, code executes |
 | `gate(id)` | Pause for an external decision (consent, challenge, approval). Resumes with one of the gate's declared outcomes. | user/operator |
 | `reconcile` | Outcome unknown (lost response on a commit). Run the action's confirmation probe procedure. Resolves to `ok`, `rewind`, `dead_end`, or `escalate(operator)` on deadline. | code |
-| `dead_end` | Terminal for this run. Provider rejected deterministically, or budgets exhausted. Report; run compensation per config if partial commits exist. | code |
+| `dead_end(reason)` | Terminal for this run. Provider rejected deterministically, or budgets exhausted. `reason` is machine-readable and carries `permanent: bool` plus optional `retry_after_hint` — an airline-control hold or in-progress ticketing is a *temporal* dead end the planner may re-attempt as a NEW run hours later; a fraud decline is permanent. Report; run compensation per config if partial commits exist. | code |
 
 Notes:
 - Your classic `replan` is split: intra-chain replan = `rewind`/`repair`;
@@ -182,6 +241,17 @@ Notes:
   decides what to do *outside* the chain.
 - `reconcile` is deliberately not collapsible into `retry`: retrying an
   unconfirmed commit is the canonical double-booking bug.
+
+**Execution modes.** `rewind`/`repair` may be executed in two conforming ways:
+- *Internal*: the runtime moves the cursor and replays within the same process.
+- *External (planner-executed)*: the run terminates with a typed outcome
+  `restart_required {rewind_to, repair_fields?, reason, budgets_remaining}` and
+  the caller (typically an LLM planner loop) starts a continuation run.
+  Conforming ONLY if: the signal is typed and machine-readable (never prose
+  the model must interpret), the continuation decrements the SAME budgets via
+  the durable run snapshot, and the continuation's trace links to the original
+  (`continuation_of`) so the logical run stays replayable. A retry limit
+  stated in prompt text is not a budget.
 
 ### 2.4 Policy
 
@@ -253,6 +323,30 @@ Requirements:
 - Raw handle values and payment data live in a sealed store keyed by alias;
   the trace itself is safe to feed to evals and to the model.
 
+### 2.6 Gate
+
+```yaml
+gate:
+  id: string
+  audience: user | operator | model   # model only if the config explicitly
+                                      # grants it; gates about money or consent
+                                      # are never model-answerable
+  payload: <type>                     # what the audience is shown to decide
+  outcomes:
+    <name>:
+      params: {field: type}           # optional: values the answer carries
+                                      # (e.g. option_id of the chosen refund)
+      bind: [intent_field, ...]       # params are written into these intent
+                                      # fields before the verdict executes
+      verdict: ok | repair(...) | rewind(...) | dead_end
+  timeout: {after: duration, verdict: <verdict>}
+```
+
+An outcome with `params` is how a gate answer feeds the chain: the user's
+choice (a cancellation option, an alternate seat) binds into intent fields
+and typically rides a `repair`. `outcome_name: verdict` is a valid shorthand
+when there are no params.
+
 ---
 
 ## 3. Verdict decision table
@@ -286,22 +380,30 @@ Rules:
 ### Verdict → next-state transitions
 
 ```
-ok           → advance cursor to next step; if last step → done
+ok           → evaluate `preconditions`; first match → its verdict; else
+               advance cursor to next step; if last step → done
 ok(empty)    → follow empty.route (gate | repair | dead_end)
 retry        → same step after backoff; attempts exhausted → escalate per
                effect class: read/mint → rewind(refresh of newest input
                handle) if rewinds remain, else dead_end; keyed commit → dead_end
-rewind(to)   → decrement rewind budget; invalidate per §4; cursor = to
-repair(to,f) → decrement rewind+repair budgets; collect proposal (model or
-               user per escalation ladder); validate proposal touches ONLY
-               listed intent fields; apply; invalidate per §4; cursor = to
+rewind(to)   → decrement rewind budget; invalidate per §4; cursor = to;
+               when replay re-crosses a selection pseudo-step, apply its
+               `rematch` spec (exact key match → code re-selects; else per
+               on_ambiguous)
+repair(to,f) → decrement rewind+repair budgets; obtain proposal (matching
+               `auto_repair` → apply its declared transform, no round-trip;
+               else model or user per escalation ladder); validate proposal
+               touches ONLY listed intent fields; apply; invalidate per §4;
+               cursor = to
 gate(id)     → park run (state=at_gate); resume with a declared outcome
                (each outcome maps to ok | repair | dead_end); timeout →
                gate's timeout verdict
-reconcile    → run confirmation probe (probe follows read policy):
+reconcile    → mark correlation record RECONCILING; run confirmation probe
+               (probe follows read policy; results matched via the record):
                landed   → treat original attempt as ok, advance
                not-landed → rewind(refresh of consumed handle) if budget, else dead_end
-               still unknown at async.deadline → escalate(operator), state=reconciling
+               still unknown at async.deadline → escalate(operator),
+               state=reconciling; `sweep` keeps re-probing until escalate_after
 dead_end     → if commits_landed non-empty → execute compensation per config
                (each compensator is itself a commit-class action with its own
                confirmation); report machine-readable reason; state=dead_end
@@ -327,7 +429,10 @@ the lineage of the handles that produced them.
 options, the selection is recorded as a derived pseudo-handle
 (`selected_outbound`, derived_from: [search_id]). Downstream results coupled
 to a selection (coupled return search, seat map for an itinerary) declare it
-in `derived_from`, so changing the selection invalidates them via I1.
+in `derived_from`, so changing the selection invalidates them via I1. On
+replay after a rewind, the selection is re-established per its `rematch` spec
+— never by re-presenting the old provider option id, which is not stable
+across re-search.
 
 **I4 — Spent handles.** A `single_use` handle consumed by a commit attempt is
 spent even if the attempt's outcome is unknown; a subsequent rewind must
@@ -343,6 +448,15 @@ handles minted by the repair's target step and everything downstream of it
 include the repaired fields — the config's `derived_from` edges plus each
 action's `input.intent` list determine this statically.
 
+**I7 — Fan-out lineage.** Concurrent runs may share a read prefix (one
+search, N candidate selections compared in parallel). Shared handles are
+stored once and referenced by alias from each run; every result collection is
+keyed by the full lineage that produced it, so branches cannot
+cross-contaminate — a return list coupled to branch A's outbound can never be
+read under branch B, even when the flights look near-identical (they differ
+in price). The join/comparison across branches happens in the planner, above
+this spec.
+
 ---
 
 ## 5. The LLM / deterministic boundary
@@ -350,7 +464,8 @@ action's `input.intent` list determine this statically.
 | Concern | Owner | Notes |
 |---|---|---|
 | Step sequencing, cursor | code | chain config is the program |
-| Attempt budget, backoff, wall clock | code | policy (§2.4); model can't extend |
+| Executing rewinds/restarts | code, or planner in external mode | conforming only via typed `restart_required` signal + snapshot-carried budgets (§2.3) |
+| Attempt budget, backoff, wall clock | code | policy (§2.4); model can't extend; never encoded in prompt text |
 | Signal → verdict classification | code | table (§3); unmatched rows fixed |
 | Handle values, storage, lineage | code | model sees opaque aliases only |
 | Invalidation | code | §4, atomic with rewind |
@@ -387,6 +502,9 @@ handles:
   selected_itinerary:              # pseudo-handle (I3): the model's pick
     minted_by: select              # a model-selection step, not an API call
     derived_from: [search_id]
+    rematch: {key: [carrier, flight_numbers, departure_times, fare_basis],
+              on_ambiguous: model} # provider itinerary ids are NOT stable
+                                   # across re-search; re-match by content
     staleness: {detect: [], ttl_hint: unknown, refresh: select}
   return_results:                  # round-trip only: returns coupled to outbound pick
     minted_by: coupled_return_search
@@ -420,7 +538,10 @@ handles:
 ```yaml
 actions:
   - id: search
-    effect: read
+    effect: read                   # double-call test: repeating has no external
+                                   # consequence; search_id merely references a
+                                   # cached result set (§2.1 rubric — a handle
+                                   # does not make this a mint)
     input: {intent: {origin: airport, destination: airport, dates: date_range,
                       cabin: enum, travelers: pax_spec}}
     output:
@@ -475,11 +596,14 @@ actions:
     output: {payload: {pnr: string, confirmations: string[]}, handles: [pnr_id]}
     idempotency: {mode: none}      # provider offers NO key → attempts=1 forced
     confirmation:
-      probe: get_pnr_by_trip       # read: query PNRs on the trip
+      probe: get_pnr_by_trip       # read: query PNRs on the trip; the
+                                   # correlation record (P3) persisted BEFORE
+                                   # dispatch is what probe/webhook match against
       signal: "pnr exists for this trip with matching itinerary"
       async: {channel: webhook, deadline: 24h}   # provider webhook confirms booking;
                                                  # probe retries tolerate eventual
                                                  # consistency (PNR queryable lag)
+      sweep: {interval: 12h, escalate_after: 72h}  # stuck-PENDING records → operator
     compensation:
       action: cancel_pnr
       window: "within ~24h of ticketing → void (no penalty); after → refund per fare rules"
@@ -511,7 +635,7 @@ actions:
 | D8 | fraud check declined (pre-commit) | pre-create_pnr guard | `dead_end` (support-only recovery) |
 | D9 | traveler/payment pre-send validation fails | initiate_booking | `repair(to: initiate_booking, fields: [travelers, payment])` — user fixes profile |
 | D10 | timeout / conn drop / ambiguous 5xx | create_pnr | `reconcile` (NEVER retry: unkeyed commit) |
-| D11 | provider "trip already completed" | revalidate | `repair(to: revalidate, fields: [trip_ref])` — auto-proposable: mint fresh trip ref |
+| D11 | provider "trip already completed" | revalidate | `repair(to: revalidate, fields: [trip_ref])` via `auto_repair` (proposal_source: code): mint a fresh trip ref, no model round-trip |
 | —  | …then generic rows 1–11 from §3 | | |
 
 Gates:
@@ -550,6 +674,12 @@ policy:
     seat_map:   {attempts: 3}                    # flaky-tolerant read
   per_chain: {max_rewinds: 3, max_repairs: 2, wall_clock: 20m, gate_timeout: 30m}
 ```
+
+Execution-mode note: the reference implementation of this chain runs in
+*external* mode — a fare expiry mid-booking terminates the run with a typed
+restart signal and the planner re-enters at `search`, re-establishing the
+selection via `rematch`. Conforming per §2.3 iff the rewind budget rides in
+the durable run snapshot, not in prompt text.
 
 ---
 
@@ -682,10 +812,11 @@ test of the abstraction.
 
 ## 8. Non-goals and open questions
 
-Non-goals (v0.1): DAG/parallel step execution inside one run (fan-out =
-multiple runs sharing a read prefix; the comparison/join happens in the
-planner above this spec); cross-chain distributed transactions; provider
-rate-limit budgeting across concurrent runs; streaming/partial results.
+Non-goals (v0.2): DAG/parallel step execution inside one run (fan-out =
+multiple runs sharing a read prefix, with lineage keying per I7; the
+comparison/join happens in the planner above this spec); cross-chain
+distributed transactions; provider rate-limit budgeting across concurrent
+runs; streaming/partial results.
 
 Open questions:
 - Should `gate` outcomes be allowed to carry model-proposed defaults ("auto-
@@ -695,3 +826,22 @@ Open questions:
   order. Current answer: config-declared, default reverse.
 - Trace retention/PII policy is deployment-specific; the alias/sealed-store
   split is the mechanism, not the policy.
+
+---
+
+## Changelog
+
+- **v0.2 (2026-07-27)** — amendments driven by the blind-compile verification
+  (compile the Spotnana air chain from spec+skill+API docs only, compare
+  against a production implementation; verification artifacts are maintained
+  in a private companion repo):
+  P3 correlation-record + cancellation-shield mechanics; external
+  (planner-executed) rewind mode with typed `restart_required` signals;
+  effect-class rubric (double-call test; returning a handle ≠ mint);
+  `mutates` for in-place commits with content-based confirmation;
+  `preconditions` for payload-level business blockers; `auto_repairs` for
+  config-declared deterministic fallbacks; `rematch` spec for selection
+  replay; structured `dead_end(reason)` with permanent vs business-timescale;
+  formal Gate schema (§2.6) with value-carrying outcomes; I7 fan-out lineage;
+  `sweep` reconciler on confirmations.
+- **v0.1 (2026-07-27)** — initial draft.
