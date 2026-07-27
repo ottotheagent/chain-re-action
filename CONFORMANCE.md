@@ -2,7 +2,7 @@
 
 Created: 2026-07-27
 Last Updated: 2026-07-27
-Applies to: SPEC.md v0.2.1
+Applies to: SPEC.md v0.2.2
 
 Behaviors ANY implementation of the spec must satisfy, independent of
 language or runtime shape (internal-rewind or external/planner-executed
@@ -49,7 +49,7 @@ values, not hard-code the spec's placeholder defaults. Trace assertions check
 - **C2.1 Discovered, not scheduled.** Advance mock time far past every
   `ttl_hint` without the provider emitting a staleness signal. Assert: no
   step fails on a timer; `ttl_hint` alone never produces a verdict.
-- **C2.2 Expired handle forces re-mint (expired TTL forces re-price).** Let
+- **C2.2 Expired handle forces re-mint (provider-reported expiry forces re-price).** Let
   a pricing/quote handle expire; attempt the downstream step. Assert: the
   staleness signal maps to `rewind(to: <handle>.refresh)`; the re-minted
   handle is re-priced/re-quoted BEFORE any commit consumes it; the commit
@@ -80,6 +80,11 @@ values, not hard-code the spec's placeholder defaults. Trace assertions check
 - **C3.4 Landed commits are not cache.** Trigger invalidation that sweeps
   past a landed commit's handles. Assert: `commits_landed` is untouched;
   landed commits are only ever unwound by explicit compensation.
+- **C3.5 Reselect excludes the failed option.** Trigger `reselect` (e.g.
+  fare-unavailable on the chosen option). Assert: `rematch` is bypassed; a
+  fresh selection is collected; the failed option is recorded as excluded and
+  cannot be re-chosen; the selection pseudo-handle's descendants are
+  invalidated.
 
 ## C4 — Budgets and stop conditions
 
@@ -132,7 +137,9 @@ values, not hard-code the spec's placeholder defaults. Trace assertions check
   timeout verdict executes; precedence per-gate over per-chain default.
 - **C6.3 Outcome params bind only declared fields.** Answer a gate with
   params. Assert: values land in the outcome's `bind` intent fields only; an
-  answer attempting to set other fields (or a handle) is rejected.
+  answer attempting to set other fields (or a handle) is rejected; an
+  outcome's declared `set` assignments (e.g. `seats: null`) apply exactly as
+  configured before the verdict executes.
 - **C6.4 `ok` outcome never re-executes the raising step.** Accept a gate
   raised by step S. Assert: the run advances past S using S's existing
   output; S's dispatch count is unchanged.
@@ -142,9 +149,11 @@ values, not hard-code the spec's placeholder defaults. Trace assertions check
 
 ## C7 — Trace and replay
 
-- **C7.1 One record per attempt.** Run any scenario. Assert: attempt records
-  are 1:1 with provider dispatches plus internal verdict transitions per
-  §2.5 semantics; `verdict_source` ∈ {table, default} — never a model value.
+- **C7.1 Event-log cardinality.** Run any scenario. Assert: `attempt` events
+  are 1:1 with provider dispatches; non-dispatch verdict applications (gate
+  park/resume, invalidation, budget exhaustion, auto-repairs, reselect
+  collection) appear as `transition` events; every state change has exactly
+  one event; `verdict_source` ∈ {table, default} — never a model value.
 - **C7.2 Deterministic re-derivation.** Take a finished run's trace + config;
   replay the decisions offline. Assert: every transition (verdict → next
   state, invalidations, budget arithmetic) is reproduced exactly.
@@ -159,9 +168,9 @@ values, not hard-code the spec's placeholder defaults. Trace assertions check
 ## C8 — Compensation
 
 - **C8.1 Dead end with landed commits compensates in declared order.** Force
-  `dead_end` after ≥2 landed commits. Assert: compensators execute in the
-  config-declared order (default reverse); each compensator's own
-  confirmation is honored.
+  `dead_end` after ≥2 landed commits. Assert: compensators execute in
+  `per_chain.compensation_order` (default: reverse of landing order); each
+  compensator's own confirmation is honored.
 - **C8.2 Replace-before-compensate.** In a replace/rebook flow, fail the
   replacement commit. Assert: the original is NOT compensated; the user is
   never left with neither artifact.

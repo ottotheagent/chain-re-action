@@ -145,11 +145,16 @@ For each step, emit the full Action record (SPEC §2.1). Non-negotiables:
 - effect from Q1/Q2 evidence, not from the endpoint's name. ("checkout",
   "validate", "initiate" are usually mints; "create", "book", "capture",
   "provision" are usually commits — but verify, some "create" calls mint.)
+  Self-expiry does not make a mint: if a repeated artifact is consequential
+  to the user (a credit hold, a reservation that blocks inventory), it is a
+  commit however short-lived.
 - Split inputs into `intent` (model-repairable) vs `handles` (code-owned).
   When in doubt, a field is a handle: the cost of wrongly letting the model
   repair a token is far higher than a round-trip to re-mint it.
-- `idempotency.mode: none` + `effect: commit` → `confirmation` is REQUIRED
-  (probe + signal + async deadline). If Q3 had no answer, stop: BLOCKED.
+- EVERY commit and compensator declares `confirmation`. Unkeyed or
+  async-finality → a probe (+ signal + async deadline) is mandatory; if Q3
+  had no answer, stop: BLOCKED. Keyed synchronous → a probe, or an explicit
+  `by_key_replay` note stating why key replay suffices.
 - `empty` block on every step where Q9 said yes, with a concrete
   `route` — usually `repair` listing the intent fields from Q9.
 - In-place commits (Q2b): set `mutates`, a content-based confirmation signal,
@@ -169,7 +174,11 @@ Start from the generic skeleton (SPEC §3) and prepend domain rows:
   the fixed default rows (reconcile-if-commit-in-flight, else dead_end).
 - Stale-handle signals (Q6) → `rewind(to: <handle>.refresh)`. Prefer the
   cheapest rewind: expired downstream handle with live upstream → re-mint
-  just the dead one.
+  just the dead one. Order matters: staleness and payload-level rows must
+  precede unconditional transport success (a 200 can carry an expiry code).
+- "The chosen option is gone but its source results may live" (fare bucket
+  sold out, plan no longer offered) → `reselect(to: <selection>)`, never a
+  `repair` with empty fields.
 - Human-decision events (Q11) → `gate(...)` with declared outcomes, audience,
   and timeout verdict. Consent about money is `audience: user`, never model.
 - Deterministic provider rejects → `dead_end`. Resist the urge to retry
@@ -236,7 +245,9 @@ Produce ONE document with these sections, in order:
 
 ## Step 7 — Self-check before delivering
 
-- [ ] Every `commit` is keyed, or has `attempts: 1` AND a confirmation probe.
+- [ ] Every commit/compensator declares `confirmation` (probe, or a
+      `by_key_replay` justification on keyed synchronous commits); unkeyed
+      commits additionally have `attempts: 1`.
 - [ ] Every unkeyed commit has a correlation record persisted before dispatch
       and a cancellation shield on the in-flight attempt (SPEC P3).
 - [ ] Every selection pseudo-handle has a `rematch` spec.

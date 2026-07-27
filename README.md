@@ -44,17 +44,18 @@ and this repo is meant to save you the incidents we learned them from.
   about a target API, the compile procedure, the output format, a self-check,
   and refusal conditions (when a chain is the wrong abstraction).
 - `CONFORMANCE.md` — behaviors any implementation must satisfy (idempotent
-  replay produces one booking, expired TTL forces re-price, budget exhaustion
-  emits dead-end with full trace, …). This is the acceptance test suite for a
-  runtime and the honesty check for the repo.
+  replay produces one booking, provider-reported expiry forces re-price,
+  budget exhaustion emits dead-end with full trace, …). This is the
+  acceptance test suite for a runtime and the honesty check for the repo.
 
 The runtime implementation is intentionally out of scope; the spec is
 language-agnostic and written to be implemented from.
 
 ## How to use it
 
-**1. Install the skill for your coding agent.** The skill is plain markdown
-with YAML frontmatter, so it drops into any agent's discovery mechanism.
+**1. Install the skill for your coding agent.** The skill uses the portable
+`SKILL.md` format: agents with native Agent Skills support discover it
+directly; other agents can consume it as project context or a task prompt.
 Keep `SPEC.md` next to it (or vendored in-repo) — the skill references it.
 
 - **Claude Code** — project or personal skills directory:
@@ -117,7 +118,7 @@ your eval/replay substrate.
 overkill (single call, fully idempotent CRUD, provider already runs the state
 machine) — if it says "use a retry wrapper," believe it.
 
-The spec is validated by blind-compile verification: an agent seeing only
+The spec is tested through blind-compile verification: an agent seeing only
 SPEC+SKILL and a target API's documentation compiles a chain config, which is
 then compared dimension-by-dimension against Otto's production implementation
 of the same chain. Those verification artifacts cite production internals and

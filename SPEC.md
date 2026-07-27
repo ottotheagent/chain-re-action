@@ -2,7 +2,7 @@
 
 Created: 2026-07-27
 Last Updated: 2026-07-27
-Status: Draft v0.2.1 (pre-implementation)
+Status: Draft v0.2.2 (pre-implementation)
 
 A domain-agnostic model for multi-step API chains where later steps mutate
 external state, intermediate results expire, and "nothing available" is a valid
@@ -100,9 +100,12 @@ action:
   # later commit (a fare session, a hold).
   # read       — repeating has no external consequence; free to repeat.
   # mint       — repeating creates distinct expiring server-side artifacts you
-  #              must track (a session, a hold, a quote handle). Repeat-safe:
-  #              worst case is orphaned state that self-expires. Never billed,
-  #              never user-visible.
+  #              must track (a session, a quote handle). Repeat-safe: worst
+  #              case is orphaned state that self-expires. Never billed, never
+  #              user-visible. If a repeated artifact IS consequential to the
+  #              user — a credit-card authorization hold ties up their limit —
+  #              it is a commit, however short-lived: mint status comes from
+  #              inconsequence, not from self-expiry.
   # commit     — durable, externally visible mutation. Exactly-once semantics
   #              required. May CREATE a new object (PNR minted, payment
   #              captured, VM created) or MUTATE an existing one in place
@@ -165,10 +168,15 @@ action:
                                   # (retry-safe) or from intent hash (also
                                   # dedupes across runs)
 
-  confirmation:                   # REQUIRED if effect=commit and mode!=keyed;
-                                  # RECOMMENDED for all commits
+  confirmation:                   # REQUIRED for EVERY commit and compensate
+                                  # action. Unkeyed or async-finality commits
+                                  # MUST declare a probe; a keyed synchronous
+                                  # commit may instead declare by_key_replay.
     probe: action_id              # a read-class action that can observe the result
     signal: <payload predicate>   # how the probe shows the commit landed
+    by_key_replay:                # keyed synchronous commits only: replaying
+      note: string                # the same idempotency key returns the
+                                  # original outcome — state why that suffices
     async:                        # if finality arrives out-of-band
       channel: webhook | poll
       deadline: duration          # after which → escalate(operator)
@@ -188,8 +196,10 @@ action:
 ```
 
 Rules:
-- A `commit` with `idempotency.mode: none` and no `confirmation` is an
-  **invalid config**. There is no safe behavior for its ambiguous failures.
+- A commit (or compensator) with no `confirmation` block is an **invalid
+  config**. Unkeyed or async-finality commits require a probe — there is no
+  safe behavior for their ambiguous failures without one. A keyed synchronous
+  commit may satisfy the block with `by_key_replay` plus its justification.
 - `input.handles` values never appear in model-visible payloads except as
   opaque aliases (e.g. `flt_x7a2`), and the model can only echo aliases back.
 - Unkeyed commits REQUIRE the P3 mechanics: a correlation record persisted
@@ -205,7 +215,8 @@ handle:
   id: string
   minted_by: action_id
   derived_from: [handle_id, ...]  # dependency edges; drives invalidation (§4)
-  single_use: bool                # true if consuming it in a commit spends it
+  single_use: bool                # default false; true if consuming it in a
+                                  # commit spends it
   rematch:                        # selection pseudo-handles only (I3): how the
     key: [intent-level fields]    # runtime re-establishes the selection after a
                                   # rewind re-mints what it was derived from.
@@ -234,7 +245,8 @@ Exactly one verdict per attempt. Produced by the deterministic classifier
 | `ok` | Attempt succeeded; payload available. `ok(empty)` flags a valid empty result and follows the action's `empty.route`. | — |
 | `retry` | Same step, same inputs, after deterministic backoff. Only for transient transport/provider faults on non-commit steps (or keyed commits). | code |
 | `rewind(to: action_id)` | A handle died; re-execute from the cheapest step that re-mints it, then replay downstream. Inputs unchanged. | code |
-| `repair(to: action_id, fields: [...])` | Rewind that additionally requires a proposed change to named *intent* fields (new date, other payment instrument). The proposal comes from model, user, or a config-declared `auto_repair` (`proposal_source: code`); the rewind mechanics stay code-owned. | model/user/config propose, code executes |
+| `repair(to: action_id, fields: [...])` | Rewind that additionally requires a proposed change to named *intent* fields (new date, other payment instrument). `fields` is never empty — a repair with nothing to repair is not a repair (use `reselect`). The proposal comes from model, user, or a config-declared `auto_repair` (`proposal_source: code`); the rewind mechanics stay code-owned. | model/user/config propose, code executes |
+| `reselect(to: selection_step)` | The chosen option is gone or was rejected (fare bucket sold out, option no longer offered) while its source results may still be live. Forces a FRESH selection at the named selection pseudo-step: `rematch` is bypassed, the failed option is recorded as excluded, downstream re-derives. | model/user select, code executes |
 | `gate(id)` | Pause for an external decision (consent, challenge, approval). Resumes with one of the gate's declared outcomes. | user/operator |
 | `reconcile` | Outcome unknown (lost response on a commit). Run the action's confirmation probe procedure. Resolves to `ok`, `rewind`, `dead_end`, or `escalate(operator)` on deadline. | code |
 | `dead_end(reason)` | Terminal for this run. Provider rejected deterministically, or budgets exhausted. `reason` is machine-readable and carries `permanent: bool` plus optional `retry_after_hint` — an airline-control hold or in-progress ticketing is a *temporal* dead end the planner may re-attempt as a NEW run hours later; a fraud decline is permanent. Report; run compensation per config if partial commits exist. | code |
@@ -280,8 +292,12 @@ policy:
       unkeyed: {attempts: 1}      # NON-NEGOTIABLE for idempotency.mode=none
     compensate: <same shape as commit>
   per_chain:
-    max_rewinds: int              # total rewind+repair budget for the run
+    max_rewinds: int              # total rewind+repair+reselect budget for the run
     max_repairs: int              # subset cap: repairs need model/user round-trips
+    compensation_order: reverse | [action_id, ...]
+                                  # execution order of compensators when a
+                                  # dead_end unwinds multiple landed commits;
+                                  # default reverse (of landing order)
     wall_clock: duration          # whole-run budget, excludes time parked at gates
     gate_timeout: duration        # default for gates that omit their own
                                   # timeout; a gate's timeout.after takes
@@ -294,9 +310,12 @@ policy:
 
 ### 2.5 Trace
 
-One record per attempt, append-only, plus a resumable run snapshot. Traces are
-eval-grade: they must let you re-derive every decision without the original
-process.
+An append-only event log plus a resumable run snapshot. Event types:
+`attempt` (1:1 with provider dispatches), `transition` (verdict applications
+that dispatch nothing: gate park/resume, invalidation, budget exhaustion,
+auto-repair application, reselect collection), `reconcile` (probe / webhook /
+sweep observations). Traces are eval-grade: they must let you re-derive every
+decision without the original process.
 
 > **OPEN — deliberately unsettled.** The *field semantics* below are
 > normative: what must be captured, and the invariants at the end of this
@@ -306,9 +325,10 @@ process.
 > validate it against, not before. See §8.
 
 ```json
-// attempt record
+// attempt event (transition/reconcile events carry the same envelope,
+// minus dispatch-specific fields)
 {
-  "run_id": "…", "chain_id": "…", "seq": 17,
+  "run_id": "…", "chain_id": "…", "seq": 17, "event_type": "attempt",
   "step_id": "revalidate", "attempt": 1,
   "t_start": "…", "t_end": "…",
   "input": {
@@ -360,8 +380,15 @@ gate:
                                       # (e.g. option_id of the chosen refund)
       bind: [intent_field, ...]       # params are written into these intent
                                       # fields before the verdict executes
-      verdict: ok | repair(...) | rewind(...) | dead_end
-  timeout: {after: duration, verdict: <verdict>}
+      set: {intent_field: value}      # optional: declared CONSTANT assignments
+                                      # (e.g. seats: null) applied as a
+                                      # config-proposed repair — the verdict
+                                      # must be repair(...) covering exactly
+                                      # these fields
+      verdict: ok | repair(...) | rewind(...) | reselect(...) | dead_end
+  timeout: {after: duration, outcome: <name>}   # or verdict: <verdict>
+                                                # directly when the timeout
+                                                # needs no set/params
 ```
 
 An outcome with `params` is how a gate answer feeds the chain: the user's
@@ -383,23 +410,29 @@ by deterministic code. The generic skeleton every domain table starts from:
 
 | # | Signal | Applies to | Verdict | Rationale |
 |---|---|---|---|---|
-| 1 | Transport success + `empty.detect` true | actions with `empty.valid` | `ok(empty)` → `empty.route` | empty is an answer (P4) |
-| 2 | Transport success | any | `ok` | |
-| 3 | Handle-staleness signal (per handle `staleness.detect`) | any consumer of that handle | `rewind(to: handle.refresh)` — shallowest dead handle wins | cheapest re-mint (P2) |
-| 4 | Rate limit (`http:429`, provider throttle code) | any | `retry` | transient by contract |
-| 5 | Transport fault (5xx, timeout, conn reset) | `read` / `mint` / keyed `commit` | `retry` | safe to repeat |
-| 6 | Transport fault (timeout, conn drop, ambiguous 5xx) | unkeyed `commit` | `reconcile` | may have landed (P3) |
-| 7 | Provider "terms changed" (price, schedule) | per config | `gate(consent)` | user decision, not failure |
-| 8 | Provider deterministic reject (validation, policy, fraud, unsupported) | any | `dead_end` | identical on every attempt |
-| 9 | Sub-resource unavailable but chain can proceed degraded (seat gone, ancillary failed) | per config | `gate(degrade_consent)` or auto-degrade + `ok` | config decides |
-| 10 | **Unmatched** | commit in flight this run | `reconcile` | safe default |
-| 11 | **Unmatched** | otherwise | `dead_end` | fail closed; NEVER model-classified |
+| 1 | Handle-staleness signal (per handle `staleness.detect`) — whether carried as an HTTP status OR inside a 2xx payload | any consumer of that handle | `rewind(to: handle.refresh)` — shallowest dead handle wins | cheapest re-mint (P2); staleness outranks transport success |
+| 2 | Transport success + `empty.detect` true | actions with `empty.valid` | `ok(empty)` → `empty.route` | empty is an answer (P4) |
+| 3 | Transport success — a FALLTHROUGH: matches only after the domain rows and rows 1–2 (all payload-level predicates) have failed to match | any | `ok` | a 200 carrying an expiry or error code must never reach this row |
+| 4 | Rate limit (`http:429`, provider throttle code) | `read` / `mint` / keyed `commit` | `retry` | transient by contract |
+| 5 | Rate limit on an unkeyed `commit` | unkeyed `commit` | `retry` ONLY if the signal is declared `rejected_before_execution: true` in config; else `reconcile` | a fresh dispatch is safe only when the provider verifiably rejects before any side effect |
+| 6 | Transport fault (5xx, timeout, conn reset) | `read` / `mint` / keyed `commit` | `retry` | safe to repeat |
+| 7 | Transport fault (timeout, conn drop, ambiguous 5xx) | unkeyed `commit` | `reconcile` | may have landed (P3) |
+| 8 | Provider "terms changed" (price, schedule) | per config | `gate(consent)` | user decision, not failure |
+| 9 | Provider deterministic reject (validation, policy, fraud, unsupported) | any | `dead_end` | identical on every attempt |
+| 10 | Sub-resource unavailable but chain can proceed degraded (seat gone, ancillary failed) | per config | `gate(degrade_consent)` or auto-degrade + `ok` | config decides |
+| 11 | **Unmatched** | commit in flight this run | `reconcile` | safe default |
+| 12 | **Unmatched** | otherwise | `dead_end` | fail closed; NEVER model-classified |
 
 Rules:
 - Every provider-documented error code MUST appear in the domain table or be
-  consciously left to rows 10–11 (list them in a `known_unmatched` note).
-- Rows 10–11 are fixed. A config may not route unmatched signals to `retry`,
+  consciously left to rows 11–12 (list them in a `known_unmatched` note).
+- Rows 11–12 are fixed. A config may not route unmatched signals to `retry`,
   `repair`, or a model decision.
+- A signal may be declared `rejected_before_execution: true` only on
+  provider-verified evidence that the rejection occurs before any side effect
+  (e.g. an edge rate limiter). Only such signals ever permit a fresh dispatch
+  of an unkeyed commit; every other signal on an unkeyed commit is
+  ambiguous-or-terminal, never retried.
 - When multiple handles report stale in one signal, rewind to the refresh
   target of the **shallowest** (earliest-minted) dead handle; its re-mint
   invalidates the rest anyway (§4).
@@ -421,22 +454,29 @@ rewind(to)   → decrement rewind budget; invalidate per §4; cursor = to;
                `rematch` spec (exact key match → code re-selects; else per
                on_ambiguous)
 repair(to,f) → decrement rewind+repair budgets; obtain proposal (matching
-               `auto_repair` → apply its declared transform, no round-trip;
-               else model or user per escalation ladder); validate proposal
-               touches ONLY listed intent fields; apply; invalidate per §4;
+               `auto_repair` or gate-outcome `set` → apply the declared
+               transform, no round-trip; else model or user per escalation
+               ladder); validate proposal touches ONLY listed intent fields;
+               apply; invalidate per §4; cursor = to
+reselect(to) → decrement rewind budget; record the failed option as excluded;
+               invalidate the selection pseudo-handle and its descendants per
+               §4; collect a FRESH selection at `to` (model or user — rematch
+               is bypassed and excluded options may not be re-chosen);
                cursor = to
 gate(id)     → park run (state=at_gate); resume with a declared outcome
-               (each outcome maps to ok | repair | dead_end); timeout →
-               gate's timeout verdict
+               (each outcome maps to ok | repair | rewind | reselect |
+               dead_end); timeout → the gate's declared timeout outcome/verdict
 reconcile    → mark correlation record RECONCILING; run confirmation probe
                (probe follows read policy; results matched via the record):
                landed   → treat original attempt as ok, advance
                not-landed → rewind(refresh of consumed handle) if budget, else dead_end
                still unknown at async.deadline → escalate(operator),
                state=reconciling; `sweep` keeps re-probing until escalate_after
-dead_end     → if commits_landed non-empty → execute compensation per config
-               (each compensator is itself a commit-class action with its own
-               confirmation); report machine-readable reason; state=dead_end
+dead_end     → if commits_landed non-empty → execute compensators in
+               per_chain.compensation_order (default: reverse of landing
+               order; each compensator is itself a commit-class action with
+               its own confirmation); report machine-readable reason;
+               state=dead_end
 ```
 
 ---
@@ -588,7 +628,7 @@ actions:
       payload: return_itineraries[]
       handles: [return_results]
       empty: {valid: true, detect: "return_itineraries.length == 0",
-              route: repair(to: select, fields: [])}   # pick different outbound
+              route: reselect(to: select)}   # pick a different outbound
     idempotency: {mode: natural}
 
   - id: checkout                   # prepares fare; does NOT lock the price
@@ -657,16 +697,16 @@ actions:
 |---|---|---|---|
 | D1 | `http:410` / `SEARCH_EXPIRED` | any consumer of `search_id` | `rewind(to: search)` |
 | D2 | `ITINERARY_FARE_EXPIRED` (search_id still live) | revalidate, initiate_booking | `rewind(to: checkout)` — cheap transparent re-mint |
-| D3 | `FARE_UNAVAILABLE` | checkout, revalidate | `repair(to: select, fields: [])` — fare bucket gone; pick another itinerary (flight may still exist) |
+| D3 | `FARE_UNAVAILABLE` | checkout, revalidate | `reselect(to: select)` — fare bucket gone; pick another itinerary (flight may still exist) |
 | D4 | `FARE_PRICE_CHANGED` (payload has old+new) | revalidate | `gate(price_change_consent)` |
-| D5 | `INVALID_SEAT_OPTION` (seat sold / cabin mismatch) | initiate_booking | `gate(seat_degrade)` — outcomes: proceed seatless → `rewind(to: initiate_booking)` with seats stripped; pick another → `repair(to: initiate_booking, fields: [seats])` |
+| D5 | `INVALID_SEAT_OPTION` (seat sold / cabin mismatch) | initiate_booking | `gate(seat_degrade)` — outcomes: proceed seatless → `repair(to: initiate_booking, fields: [seats])` with `set: {seats: null}`; pick another → `repair(to: initiate_booking, fields: [seats])` bound from the answer |
 | D6 | `http:502 BOOKING_FAILED` (codeshare/split-ticket deterministic reject) | create_pnr | `dead_end` |
 | D7 | `http:424 NON_RETRYABLE_THIRDPARTY_ERROR` | create_pnr | `dead_end` |
 | D8 | fraud check declined (pre-commit) | pre-create_pnr guard | `dead_end` (support-only recovery) |
 | D9 | traveler/payment pre-send validation fails | initiate_booking | `repair(to: initiate_booking, fields: [travelers, payment])` — user fixes profile |
 | D10 | timeout / conn drop / ambiguous 5xx | create_pnr | `reconcile` (NEVER retry: unkeyed commit) |
 | D11 | provider "trip already completed" | revalidate | `repair(to: revalidate, fields: [trip_ref])` via `auto_repair` (proposal_source: code): mint a fresh trip ref, no model round-trip |
-| —  | …then generic rows 1–11 from §3 | | |
+| —  | …then generic rows 1–12 from §3 | | |
 
 Gates:
 
@@ -677,13 +717,16 @@ gates:
     payload: {old: money, new: money}
     outcomes:
       accept:  ok            # proceed with new price (revalidate output stands)
-      decline: repair(to: select, fields: [])   # or dead_end per product choice
+      decline: reselect(to: select)   # or dead_end per product choice
     timeout: {after: 30m, verdict: dead_end}
   seat_degrade:
     audience: user
-    outcomes: {proceed_seatless: rewind(to: initiate_booking),
-               choose_other: repair(to: initiate_booking, fields: [seats])}
-    timeout: {after: 15m, verdict: rewind(to: initiate_booking)}  # default: seatless
+    outcomes:
+      proceed_seatless: {set: {seats: null},        # clears the invalid seat —
+                         verdict: repair(to: initiate_booking, fields: [seats])}
+      choose_other:     {params: {seats: seat_selection}, bind: [seats],
+                         verdict: repair(to: initiate_booking, fields: [seats])}
+    timeout: {after: 15m, outcome: proceed_seatless}  # default: seatless
 ```
 
 ### 6.4 What the invalidation graph buys (round-trip case)
@@ -756,13 +799,18 @@ actions:
     input: {intent: {email: string, name: string}}
     output: {payload: customer, handles: [customer_id]}
     idempotency: {mode: keyed, key_scope: intent}   # same email+name dedupes across runs
+    confirmation: {by_key_replay: {note: "keyed synchronous: replaying the
+                   intent-scoped key returns the existing customer"}}
     compensation: {action: none, ordering_note: "orphan customer records are harmless; GC out of band"}
 
-  - id: authorize                   # mint: places a HOLD, not a charge
-    effect: mint                    # repeat-safe: un-captured holds self-expire;
-                                    # NOTE: unlike Spotnana mints, this one has a
-                                    # real compensator (release) because holds
-                                    # tie up the customer's credit limit for days
+  - id: authorize                   # places a HOLD, not a charge — but a hold
+    effect: commit                  # ties up the customer's credit limit for
+                                    # days and a second call creates a second
+                                    # consequential hold: by the §2.1 rubric
+                                    # this is a COMMIT even though it
+                                    # self-expires (mint = inconsequential, not
+                                    # merely short-lived). Keyed → ambiguous
+                                    # failures retry safely on the same key.
     input: {intent: {amount: money, instrument: payment_method_ref},
             handles: [customer_id]}
     output:
@@ -771,6 +819,8 @@ actions:
       empty: {valid: true, detect: "status == 'declined'",
               route: repair(to: authorize, fields: [instrument])}   # decline = answer, not error (P4)
     idempotency: {mode: keyed, key_scope: run}
+    confirmation: {by_key_replay: {note: "keyed synchronous: replaying the run-scoped
+                   key returns the original intent + hold status"}}
     compensation:
       action: release_hold
       window: "any time before capture; hold self-expires ~7d anyway"
@@ -794,6 +844,7 @@ actions:
     effect: compensate
     input: {handles: [intent_id]}
     idempotency: {mode: natural}     # releasing a released hold: no-op
+    confirmation: {probe: get_intent, signal: "intent.status == 'canceled'"}
 
   - id: refund
     effect: compensate
@@ -830,7 +881,7 @@ gates:
 | Dimension | Spotnana air | Card payment |
 |---|---|---|
 | Idempotency on commit | none → attempts=1, `reconcile` path is load-bearing | keyed → ambiguous failure is plain `retry`; `reconcile` nearly vestigial |
-| Reservation step | mint handles are free garbage (self-expire, no cost) | hold ties up real credit → mint has a genuine compensator |
+| Reservation step | mint handles are free garbage (self-expire, no cost) | hold ties up real credit → the reservation is itself a keyed COMMIT with a real compensator, not a mint |
 | Mid-chain user gate | price-change consent (exceptional path) | 3DS (routine path, must be designed for) |
 | "Nothing available" | empty search results | card declined (with machine-readable reason feeding the repair) |
 | Finality | webhook after commit + eventual-consistency probe | webhook after capture; probe is authoritative immediately |
@@ -862,8 +913,12 @@ Open questions:
 - Should `gate` outcomes be allowed to carry model-proposed defaults ("auto-
   accept price increases under $5")? Current answer: no — thresholded
   auto-consent is a *policy* field if a product wants it, still deterministic.
-- Compensation of multi-commit runs: strict reverse order vs config-declared
-  order. Current answer: config-declared, default reverse.
+- Compensation of multi-commit runs: resolved in v0.2.2 —
+  `per_chain.compensation_order: reverse | [action_id, ...]`, default reverse.
+- Machine-validated config schema + fixtures: once serialization is pinned,
+  add a schema validator so example/spec contradictions are caught
+  mechanically (several v0.2.1 defects were exactly that: examples exercising
+  operations the grammar could not represent).
 - Trace retention/PII policy is deployment-specific; the alias/sealed-store
   split is the mechanism, not the policy.
 
@@ -871,6 +926,20 @@ Open questions:
 
 ## Changelog
 
+- **v0.2.2 (2026-07-27)** — external-review fixes (semantic contradictions
+  between schema, examples, skill, and conformance): payment `authorize`
+  reclassified mint→keyed commit + mint rubric sharpened (consequence, not
+  self-expiry, decides); new `reselect(to)` verdict replacing the undefined
+  `repair(fields: [])` idiom; generic decision table reordered so staleness /
+  payload predicates outrank transport success (a 200 carrying an expiry code
+  can no longer classify as ok); 429-on-unkeyed-commit resolved via
+  `rejected_before_execution` signal flag (default: reconcile, never retry);
+  confirmation now REQUIRED on every commit/compensator (probe for
+  unkeyed/async; `by_key_replay` justification allowed for keyed
+  synchronous); gate outcomes gained `set` (declared constant assignments —
+  fixes proceed-seatless never clearing seats) and timeout-by-outcome; trace
+  re-modeled as event log (`attempt` | `transition` | `reconcile`);
+  `per_chain.compensation_order` modeled; `single_use` default documented.
 - **v0.2.1 (2026-07-27)** — round-2 grammar fixes: `ok` allowed in
   `empty.route` and `preconditions.verdict` (proceed-degraded, resolving a
   self-contradiction with example A's seat_map); gate outcome `ok` semantics
