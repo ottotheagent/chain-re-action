@@ -48,7 +48,11 @@ unimplementable safely (SPEC §2.1 makes that an invalid config).
 
 Interview the API owner, the provider docs, and any empirical-behavior notes.
 Docs lie by omission; prefer empirical evidence, and record the source of
-each answer (`documented` / `observed` / `assumed`). Ask, per candidate step:
+each answer (`documented` / `observed` / `assumed`). A claim that appears
+ONLY in SPEC.md's worked examples — including when your target domain IS an
+example's domain — is tagged `spec-example`: never evidence; route its
+signals to `known_unmatched` until independently sourced. Ask, per candidate
+step:
 
 **Effect classification**
 1. If this call runs twice with the same inputs, what exists afterwards?
@@ -204,7 +208,9 @@ per_step:
   read:  {attempts: 3, backoff: {base: 500ms, factor: 2, jitter: full, max: 8s}}
   mint:  {attempts: 2, backoff: {base: 1s,   factor: 2, jitter: full, max: 10s}}
   commit: {keyed: {attempts: 3}, unkeyed: {attempts: 1}}   # unkeyed=1 is not overridable
-per_chain: {max_rewinds: 3, max_repairs: 2, wall_clock: <~3× sum of latency_hints>, gate_timeout: <product decision>}
+per_chain: {max_rewinds: 3, max_repairs: 2,
+            wall_clock: <max(3× Σ latency_hints, 2× slowest step timeout)>,
+            gate_timeout: <product decision>}
 ```
 
 Set `timeout` per step from Q14 worst-case, not average. The slowest step is

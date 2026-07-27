@@ -56,8 +56,10 @@ values, not hard-code the spec's placeholder defaults. Trace assertions check
   never executes against the stale handle.
 - **C2.3 Cheapest live rewind target.** Expire a downstream handle while its
   upstream ancestor is live. Assert: rewind targets the dead handle's refresh
-  step, not the chain start. **[policy-param]** (granularity may be config-
-  coarsened, but never *finer* than declared refresh targets).
+  step, not the chain start. **[policy-param]** — a config may deliberately
+  rewind coarser than the declared refresh target (e.g. always to chain
+  start); it must never rewind to a point that skips re-minting the dead
+  handle.
 - **C2.4 Spent means spent.** `single_use` handle consumed by an attempt with
   UNKNOWN outcome. Assert: the handle is marked spent; any replay re-mints it;
   the old value is never re-presented to the provider.

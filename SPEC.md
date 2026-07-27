@@ -134,14 +134,14 @@ action:
     empty:                        # only for actions where empty is valid
       valid: bool
       detect: <payload predicate> # e.g. "results.length == 0"
-      route: <verdict>            # ok | gate | repair | dead_end — what
-                                  # ok(empty) maps to; `ok` = proceed to the
-                                  # next step degraded (e.g. no seat map →
+      route: <verdict>            # ok | gate | repair | reselect | dead_end —
+                                  # what ok(empty) maps to; `ok` = proceed to
+                                  # the next step degraded (e.g. no seat map →
                                   # book seatless), recorded in the trace
 
   preconditions:                  # payload-level business blockers on ok results
     - when: <payload predicate>   # e.g. "no ticket with EXCHANGEABLE_BY_OBT"
-      verdict: <ok|gate|dead_end|repair(...)>   # ok = matched but proceed
+      verdict: <ok|gate|dead_end|repair(...)|reselect(...)>   # ok = matched but proceed
                                   # degraded (skip the dependent capability),
                                   # recorded in the trace
       reason: string
@@ -442,7 +442,7 @@ Rules:
 ```
 ok           → evaluate `preconditions`; first match → its verdict; else
                advance cursor to next step; if last step → done
-ok(empty)    → follow empty.route (ok | gate | repair | dead_end;
+ok(empty)    → follow empty.route (ok | gate | repair | reselect | dead_end;
                ok = advance degraded)
 retry        → same step after backoff; attempts exhausted → escalate per
                effect class: read/mint → rewind(refresh of newest input
@@ -555,6 +555,13 @@ one.
 ---
 
 ## 6. Worked example A — Spotnana air booking chain
+
+> **Provenance note.** This example is illustrative, drawn from one
+> production integration's empirical notes. Its rows are NOT evidence: when
+> compiling a chain — even for this same provider — every claim must be
+> independently sourced from your own API documentation and tagged. Treat
+> uncorroborated example rows as `spec-example` hearsay and route their
+> signals to `known_unmatched` until verified.
 
 Failure shape: expiring opaque handles at every hop, no idempotency key on
 the commit, price can change mid-chain, coupled sub-searches (round-trip),
@@ -926,6 +933,12 @@ Open questions:
 
 ## Changelog
 
+- **v0.2.3 (2026-07-27)** — round-3 blind-compile fixes: `reselect` added to
+  the `empty.route` and `preconditions.verdict` enums (v0.2.2 used it in
+  example A without extending the grammar); §6 provenance note + SKILL
+  `spec-example` evidence tag (worked-example rows are never evidence, even
+  for the example's own domain); wall_clock heuristic recalibrated
+  (`max(3× Σ latency_hints, 2× slowest timeout)`); C2.3 wording clarified.
 - **v0.2.2 (2026-07-27)** — external-review fixes (semantic contradictions
   between schema, examples, skill, and conformance): payment `authorize`
   reclassified mint→keyed commit + mint rubric sharpened (consequence, not
