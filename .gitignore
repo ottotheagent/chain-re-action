@@ -1,4 +1,5 @@
-# Verification artifacts cite otto-server internals and Spotnana empirical
-# API behavior — this repo is public; keep them local-only.
+# Verification artifacts that cite production internals or partner-gated API
+# behavior — this repo is public; keep them local-only. (Public-docs-only
+# compiles are published under compiles/ instead.)
 verification/
 .gstack/

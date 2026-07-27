@@ -781,7 +781,7 @@ one.
 
 ---
 
-## 6. Worked example A — Spotnana air booking chain
+## 6. Worked example A — Flight booking chain (GDS-backed reseller)
 
 > **Provenance note.** This example is illustrative, drawn from one
 > production integration's empirical notes. Its rows are NOT evidence: when
@@ -1187,7 +1187,7 @@ gates:
 
 ### 7.4 Shape contrast vs example A (why generality holds)
 
-| Dimension | Spotnana air | Card payment |
+| Dimension | Flight booking (ex. A) | Card payment |
 |---|---|---|
 | Idempotency on commit | none → attempts=1, `reconcile` path is load-bearing | keyed → ambiguous failure is `retry` on the same key — but key retention (~24h) and cached-error replay keep `reconcile` load-bearing here too, just rarer |
 | Reservation step | mint handles are free garbage (self-expire, no cost) | hold ties up real credit → the reservation is itself a keyed COMMIT with a real compensator; its expiry kills the whole intent (rewind to creation) |
@@ -1323,7 +1323,7 @@ Open questions:
   threshold (§2.4) and the trace serialization format (§2.5). Added
   `CONFORMANCE.md` — implementation-agnostic behavioral requirements.
 - **v0.2 (2026-07-27)** — amendments driven by the blind-compile verification
-  (compile the Spotnana air chain from spec+skill+API docs only, compare
+  (compile example A's flight-booking chain from spec+skill+API docs only, compare
   against a production implementation; verification artifacts cite production
   internals and are kept out of this public repo):
   P3 correlation-record + cancellation-shield mechanics; external
