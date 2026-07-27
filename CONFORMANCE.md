@@ -2,7 +2,7 @@
 
 Created: 2026-07-27
 Last Updated: 2026-07-27
-Applies to: SPEC.md v0.3.2
+Applies to: SPEC.md v0.4
 
 Behaviors ANY implementation of the spec must satisfy, independent of
 language or runtime shape (internal-rewind or external/planner-executed
@@ -27,9 +27,11 @@ values, not hard-code the spec's placeholder defaults. Trace assertions check
   unkeyed commit dispatch; resume from snapshot + trace. Assert: resume
   enters `reconcile` (probe first), never re-dispatches; end state contains
   exactly one committed artifact.
-- **C1.3 Keyed retry reuses the key.** Keyed commit; induce ambiguous
-  failure. Assert: the retry carries the SAME idempotency key; at most one
-  artifact exists provider-side.
+- **C1.3 Keyed retry reuses the key — within retention.** Keyed commit;
+  induce ambiguous failure. Assert: the retry carries the SAME idempotency
+  key; at most one artifact exists provider-side. Then age the attempt past
+  `key_retention`: assert the old key is never re-dispatched — recovery
+  routes to `reconcile` (probe), exactly as if unkeyed.
 - **C1.4 Correlation record precedes dispatch.** Kill the process between
   correlation-record persist and dispatch, and again between dispatch and
   response. Assert: in both cases a durable PENDING record exists that the
@@ -44,7 +46,7 @@ values, not hard-code the spec's placeholder defaults. Trace assertions check
   `reconciling`; sweep re-probes until `escalate_after`; no auto-`dead_end`
   and no re-dispatch.
 - **C1.8 Safe rejects don't consume the exactly-once attempt.** Declare a
-  signal `rejected_before_execution: true` (provider-documented no-side-effect
+  signal `no_side_effect: true` (provider-documented no-side-effect
   rejection); emit it on an unkeyed commit. Assert: re-dispatch is permitted
   up to `safe_reject_redispatch`; the single uncertain-dispatch attempt
   remains available; any signal NOT so declared still consumes it
@@ -80,6 +82,11 @@ values, not hard-code the spec's placeholder defaults. Trace assertions check
   expiring handles. Assert: rewind targets the deepest (most recently minted)
   candidate's refresh first; if the same signal recurs, the next-shallower
   candidate is tried; each escalation consumes rewind budget.
+- **C2.6 Landed-commit business deadline fires.** Configure
+  `business_expiry` on a commit; let the provider-returned deadline pass
+  while the run is parked or working elsewhere. Assert: on the next step
+  arrival or gate resume, `on_expiry` fires; the commit remains in
+  `commits_landed` (I5) and compensation still sees it.
 
 ## C3 — Invalidation and lineage
 
@@ -122,10 +129,16 @@ values, not hard-code the spec's placeholder defaults. Trace assertions check
   (c) supplies a handle value, (d) proposes repair values for non-listed
   fields. Assert: all four are rejected at validation; budgets and
   classification unchanged; the rejection is traced.
-- **C4.3 Wall-clock excludes gate parking.** Park a run at a gate longer than
-  `wall_clock`. Assert: the run is not wall-clock-killed while parked;
-  gate timeout governs instead (per-gate `timeout.after`, else
-  `per_chain.gate_timeout`).
+- **C4.3 Wall-clock excludes parked states.** Park a run at a gate longer
+  than `wall_clock`, and separately hold a run in reconciling-awaiting-async
+  past `wall_clock`. Assert: neither is wall-clock-killed; the gate timeout
+  and the confirmation `async.deadline`/`sweep` govern their respective
+  states.
+- **C4.5 Same run_key, one run.** Create a run with `run_key` K; call
+  run-creation again with K (concurrently and after completion). Assert:
+  exactly one run ever exists for K — the second call returns the existing
+  run's snapshot state, dispatching nothing; a distinct key creates a
+  distinct run.
 - **C4.4 External-mode budget carryover.** In planner-executed mode, emit
   `restart_required`, start a continuation run. Assert: the continuation
   decrements the SAME budget counters (from the durable snapshot); N
@@ -208,6 +221,12 @@ values, not hard-code the spec's placeholder defaults. Trace assertions check
   the gate fires on EVERY path reaching that commit — including replays after
   rewind/repair/reselect — and the run parks (state=at_gate) before any
   dispatch each time.
+- **C8.6 Revocation events are never dropped.** Configure `revocation` on a
+  commit; emit a declared watch signal within `window` after the commit's
+  ok. Assert: the event routes per config (gate or operator escalation) with
+  a trace record; the run/booking state reflects the revocation; a silent
+  drop is a conformance failure even when the run had already reached
+  `done`.
 - **C8.5 Compensation sub-chains park correctly.** For a commit whose
   `compensation.chain` includes a gate (e.g. refund-option choice). Assert:
   during unwind the run parks in state=compensating at that gate; the gate's

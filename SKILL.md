@@ -54,7 +54,14 @@ example's domain — is tagged `spec-example`: never evidence; route its
 signals to `known_unmatched` until independently sourced. When the corpus is
 itself an empirical-notes document, tag restated API shapes (endpoints,
 fields, enums) as `documented` and behavioral claims (TTLs, timing, failure
-behavior) as `observed`. Ask, per candidate step:
+behavior) as `observed`. Two more tags for public-docs corpora:
+`documented-by-omission` — an otherwise-complete reference that nowhere
+mentions a feature (no idempotency key documented anywhere) is evidence of
+absence, stronger than `assumed`; and treat search-snippet-attributed claims
+as unverified until the page itself is fetched (else downgrade to
+`assumed`). Public docs also arrive per PAGE, not per step — elicit per page
+and reassemble; the per-step log is the output format, not the reading
+order. Ask, per candidate step:
 
 **Effect classification**
 1. If this call runs twice with the same inputs, what exists afterwards?
@@ -125,7 +132,15 @@ behavior) as `observed`. Ask, per candidate step:
 14. Per step: expected and worst-case latency? Which step is slowest?
 15. After the final commit: when is the result truly final vs eventually
     consistent? What confirms it (webhook, poll), and after what deadline do
-    you hand off to a human?
+    you hand off to a human? Can a SUCCEEDED result be revoked later (a
+    refund that fails days after creation succeeded, an airline-initiated
+    change)? → `revocation` watch.
+
+**Integrator-mandated steps**
+16. Which NON-provider steps does your own stack mandate before a commit —
+    fraud screening, payment tokenization proxies, compliance checks? These
+    compile as actions/gates in the chain like any provider step, with their
+    own failure taxonomy — never as invisible middleware.
 
 ## Step 2 — Build the handle graph
 
@@ -178,6 +193,17 @@ For each step, emit the full Action record (SPEC §2.1). Non-negotiables:
 - Unkeyed commits inherit the P3 mechanics: correlation record persisted
   before dispatch + cancellation shield. Say WHERE the record lives — it must
   survive process death.
+- **Name the enforcement point for every budget.** attempts=1 is only real
+  if the transport layer's DEFAULT retry policy is pinned to zero for commit
+  dispatches — shared HTTP clients often carry a default that silently
+  applies when per-call options are omitted, and that exact mechanism
+  produced a real production double-booking vector (the pin existed for one
+  provider's client and was never applied to another's). The config states
+  the mechanism (per-call option, dedicated client, middleware), and the
+  conformance test must exercise the transport boundary, not a mock above it.
+- Confirmation probes must be runnable without the commit's own output
+  (SPEC §2.1 probe rule); if only get-by-locator reads exist, the
+  correlation record carries the lookup keys, or the compile is BLOCKED.
 - Q11 business blockers → `preconditions`; Q9b prescribed fallbacks →
   `auto_repairs`.
 
@@ -228,8 +254,10 @@ Set `timeout` per step from Q14 worst-case, not average. The slowest step is
 usually the commit; give it headroom rather than letting a tight timeout
 manufacture ambiguous outcomes.
 
-`wall_clock` covers active execution including reconcile probes and
-compensation sub-chains; time parked at gates is excluded (SPEC §2.4).
+`wall_clock` covers active execution including reconcile probe attempts and
+compensation sub-chains; time parked at gates or in
+reconciling-awaiting-async is excluded (SPEC §2.4) — provider finality can
+take hours and must not blow the run clock.
 
 Budgets are config, enforced by code — never prompt text. If the executor is
 a planner loop (external mode, SPEC §2.3), budgets ride in the durable run
@@ -290,6 +318,14 @@ booking's `pnr_id` feeding the exchange chain).
 - [ ] Payload business blockers are `preconditions`, not overloaded `empty`.
 - [ ] No TTL is used as an enforcement timer anywhere (hints only).
 - [ ] No budget or retry limit lives in prompt text.
+- [ ] Every budget names its enforcement point; transport default retries
+      are pinned to zero for commit dispatches, and the test exercises the
+      transport boundary.
+- [ ] Every confirmation probe is runnable without the commit's own output.
+- [ ] Landed-commit business deadlines (`business_expiry`) and post-ok
+      revocation paths (`revocation`) are declared where the domain has them.
+- [ ] A variant axis is declared when the provider runs parallel rails or
+      per-vertical regimes.
 - [ ] Compensation ordering stated for any replace/rebook flow.
 
 Deliver the config. Implementation (runtime, client code) is a separate task

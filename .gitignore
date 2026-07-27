@@ -1,3 +1,4 @@
 # Verification artifacts cite otto-server internals and Spotnana empirical
 # API behavior — this repo is public; keep them local-only.
 verification/
+.gstack/

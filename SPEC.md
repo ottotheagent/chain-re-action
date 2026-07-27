@@ -2,7 +2,7 @@
 
 Created: 2026-07-27
 Last Updated: 2026-07-27
-Status: Draft v0.3.2 (pre-implementation)
+Status: Draft v0.4 (pre-implementation)
 
 A domain-agnostic model for multi-step API chains where later steps mutate
 external state, intermediate results expire, and "nothing available" is a valid
@@ -142,9 +142,28 @@ action:
     payload: <type>               # decision-relevant data returned to caller/model
     handles:                      # handles this action mints (see 2.2)
       - handle_id
+    business_expiry:              # commit only, optional: a landed commit
+      field: <payload path>       # whose USEFULNESS expires at a provider-
+      on_expiry: <verdict>        # returned contractual deadline (a held
+                                  # booking's PaymentTimeLimit — unticketed
+                                  # PNRs are auto-cancelled by the airline).
+                                  # Not staleness (I5: landed commits aren't
+                                  # cache): the runtime evaluates the deadline
+                                  # as an implicit precondition on every later
+                                  # step and on gate resume, firing on_expiry —
+                                  # usually dead_end(permanent: false) or a
+                                  # gate. Provider-returned contractual
+                                  # deadlines MAY be evaluated proactively:
+                                  # P2 forbids trusting TTL folklore, not
+                                  # deadlines the response itself declares.
     empty:                        # only for actions where empty is valid
       valid: bool
-      detect: <payload predicate> # e.g. "results.length == 0"
+      detect: <response predicate> # over the FULL response, status included:
+                                  # the domain's valid-empty may arrive on an
+                                  # error transport (a card decline is an HTTP
+                                  # 402 error object). e.g. "results.length
+                                  # == 0", or "status == 402 && error.type ==
+                                  # 'card_error'"
       route: <verdict>            # ok | gate | repair | reselect | dead_end —
                                   # what ok(empty) maps to; `ok` = proceed to
                                   # the next step degraded (e.g. no seat map →
@@ -174,6 +193,14 @@ action:
   # max_repairs. Use for provider-prescribed fallbacks ("retry without
   # filters before reporting no availability").
 
+  probe_only: bool                # default false; true for read actions that
+                                  # exist only as confirmation probes. Probe
+                                  # results feed the reconcile procedure —
+                                  # "nothing found" there means NOT-LANDED,
+                                  # not a business empty — so probe_only
+                                  # actions take no `empty` block and no
+                                  # preconditions.
+
   idempotency:
     mode: keyed | natural | none
     # keyed   — provider accepts a client idempotency key; safe to retry on
@@ -184,6 +211,22 @@ action:
     key_scope: run | intent       # keyed only: key derived from run_id+step
                                   # (retry-safe) or from intent hash (also
                                   # dedupes across runs)
+    key_retention: duration | unlimited
+                                  # keyed only: how long the provider retains
+                                  # keys (often ~24h). Beyond retention the
+                                  # action is EFFECTIVELY UNKEYED: never
+                                  # re-dispatch an old key — probe instead.
+                                  # key_scope: intent dedup is unsound past
+                                  # this window.
+    replay_semantics: reexecutes | returns_cached
+                                  # keyed only: what replaying a key does.
+                                  # returns_cached (common) means a replayed
+                                  # response — INCLUDING a cached error — is
+                                  # not a fresh attempt; a cached 5xx is
+                                  # indistinguishable from a fresh one except
+                                  # by attempt count, and a persistently
+                                  # replayed error routes to reconcile, not
+                                  # more retries.
 
   confirmation:                   # REQUIRED for EVERY commit and compensate
                                   # action. Unkeyed or async-finality commits
@@ -214,6 +257,30 @@ action:
                                   # penalty; after → refund w/ penalty"
     ordering_note: string         # e.g. "commit replacement BEFORE compensating
                                   # original" (never leave user with nothing)
+    ladder:                       # alternative to action/chain: condition-
+      - {when: <predicate>, chain: [action_id, ...]}
+      - {when: <predicate>, action: action_id}
+      - {else: escalate(operator)}
+                                  # tiered compensation — "within void window →
+                                  # void; after → refund-quote flow; rail
+                                  # unsupported → operator". First matching
+                                  # rung runs. Compensator interdependence
+                                  # (voiding the ticket is what re-enables
+                                  # cancelling the booking) is carried by
+                                  # per_chain.compensation_order plus rung
+                                  # order — state it in ordering_note.
+
+  revocation:                     # commit only, optional: landed-but-revocable
+    watch: [signal, ...]          # — success can be revoked AFTER ok (a refund
+    window: duration              # that fails asynchronously days later, an
+    route: gate(id) | escalate(operator)
+                                  # airline-initiated change to a ticketed
+                                  # PNR). Not compensation (nobody chose to
+                                  # undo it) and not invalidation (I5): an
+                                  # external mutation surfaced through the
+                                  # declared watch (webhook/sweep) and routed
+                                  # to a decision-maker. Silently dropping a
+                                  # revocation event is non-conforming.
 
   entry_gate: gate_id             # optional: evaluated EVERY time the cursor
                                   # reaches this action — including replays
@@ -249,6 +316,12 @@ Rules:
 - A commit with `mutates` and `compensation.action: none` MUST name its
   pre-commit safety mechanism (usually a consent gate) in `ordering_note` —
   when no undo exists, the protection has to sit before the commit.
+- A confirmation probe MUST be runnable WITHOUT the commit's own output: a
+  get-by-locator probe cannot run when the locator was in the lost response.
+  If the provider offers only such reads, the correlation record must carry
+  lookup keys the probe can use (list-by-window + correlation label); if
+  neither exists, the config is BLOCKED — there is no safe ambiguous-failure
+  story.
 
 ### 2.2 Handle
 
@@ -273,9 +346,21 @@ handle:
     detect: [signal, ...]         # e.g. [http:410, code:ITINERARY_FARE_EXPIRED]
                                   # observed ON USE of this handle downstream
     ttl_hint: duration | unknown  # planning hint ONLY; never enforced by timer
+    contractual: bool             # default false; true when the provider
+                                  # DOCUMENTS the TTL as contract (a published
+                                  # 15-minute order token) — planners and
+                                  # preconditions may then trust the number;
+                                  # detection signals are still required
     refresh: action_id            # cheapest step that re-mints this handle;
                                   # the rewind target when it dies
 ```
+
+Client-held results: when a read returns payloads with NO server-side handle
+(the results live only client-side), declare a pseudo-handle for the result
+set anyway — minted_by that read, derived_from its inputs — so downstream
+selections have their I3 lineage. Such pseudo-handles have no provider
+staleness; any validity limit is business-level (contractual hints or
+preconditions).
 
 ### 2.3 Verdict
 
@@ -335,8 +420,8 @@ policy:
         attempts: 1               # counts UNCERTAIN dispatches — NON-NEGOTIABLE
                                   # for idempotency.mode=none
         safe_reject_redispatch: 2 # additional dispatches permitted ONLY after
-                                  # signals declared rejected_before_execution
-                                  # (§3): a provider-documented no-side-effect
+                                  # signals declared no_side_effect (§3): a
+                                  # provider-documented no-side-effect
                                   # rejection did not consume the exactly-once
                                   # attempt, so re-dispatching does not violate
                                   # it. Anything without that guarantee still
@@ -349,7 +434,10 @@ policy:
                                   # execution order of compensators when a
                                   # dead_end unwinds multiple landed commits;
                                   # default reverse (of landing order)
-    wall_clock: duration          # whole-run budget, excludes time parked at gates
+    wall_clock: duration          # whole-run budget; excludes time parked at
+                                  # gates AND in reconciling-awaiting-async
+                                  # (async.deadline / sweep govern those —
+                                  # provider finality can take hours)
     gate_timeout: duration        # default for gates that omit their own
                                   # timeout; a gate's timeout.after takes
                                   # precedence over this chain-level value
@@ -441,6 +529,13 @@ gate:
   timeout: {after: duration, outcome: <name>}   # or verdict: <verdict>
                                                 # directly when the timeout
                                                 # needs no set/params
+  payload_expiry:                 # optional: the gate's payload embeds its own
+    field: <payload path>         # validity deadline (a refund quote valid
+    verdict: <verdict>            # until T). An answer arriving after that
+                                  # deadline is rejected and this verdict
+                                  # fires instead (typically rewind to
+                                  # re-quote) — parked time doesn't freeze
+                                  # the facts the user is deciding on.
 ```
 
 An outcome with `params` is how a gate answer feeds the chain: the user's
@@ -459,6 +554,44 @@ stands: the run advances past the step that raised the gate, using that
 step's already-produced output. It never re-executes the raising step — use
 `rewind` in the outcome if re-execution is what you mean.
 
+### 2.7 Variants
+
+Some providers run parallel rails through one API surface (GDS vs NDC
+content; per-vertical behavior differences under one endpoint family — one
+provider documents request dedup for cars but not accommodations). A config
+may declare a variant axis:
+
+```yaml
+variants:
+  axis: rail
+  values: [GDS, NDC]
+```
+
+Any action, verdict row, gate, or field may carry `only: [value, ...]` to
+scope it to specific variant values. A run binds ONE value at start (from
+intent or the first read's payload) and never switches mid-run; switching
+rails is a new run. Variants are compile-time structure — the model never
+chooses a rail at runtime.
+
+### 2.8 Run creation is a commit too
+
+The dominant duplicate-commit vector observed in production is not mid-chain
+ambiguity — it is the CALLER re-invoking the chain (a planner retry storm at
+the tool boundary, a user double-submit). A conforming runtime therefore
+accepts a caller-supplied `run_key` on run creation:
+
+- same `run_key` → the existing run is returned (its current snapshot
+  state), never a second run;
+- `run_key` derives from the user-visible task (trip + intent), never from
+  time or attempt counters;
+- the run snapshot records it, and continuation runs (external mode, §2.3)
+  reuse it.
+
+Chain-internal exactly-once (§2.1/§2.4) protects against duplicate
+DISPATCHES; `run_key` protects against duplicate RUNS. Both are required —
+attempts=1 inside a chain is worthless if the caller can mint sibling runs
+at will.
+
 ---
 
 ## 3. Verdict decision table
@@ -469,10 +602,10 @@ by deterministic code. The generic skeleton every domain table starts from:
 | # | Signal | Applies to | Verdict | Rationale |
 |---|---|---|---|---|
 | 1 | Handle-staleness signal (per handle `staleness.detect`) — whether carried as an HTTP status OR inside a 2xx payload | any consumer of that handle | `rewind(to: handle.refresh)` — shallowest dead handle wins | cheapest re-mint (P2); staleness outranks transport success |
-| 2 | Transport success + `empty.detect` true | actions with `empty.valid` | `ok(empty)` → `empty.route` | empty is an answer (P4) |
+| 2 | `empty.detect` matches — on transport success OR a declared error-transport shape (an HTTP 402 decline) | actions with `empty.valid` | `ok(empty)` → `empty.route` | empty is an answer (P4), whatever transport it rides |
 | 3 | Transport success — a FALLTHROUGH: matches only after the domain rows and rows 1–2 (all payload-level predicates) have failed to match | any | `ok` | a 200 carrying an expiry or error code must never reach this row |
 | 4 | Rate limit (`http:429`, provider throttle code) | `read` / `mint` / keyed `commit` | `retry` | transient by contract |
-| 5 | Rate limit or documented safe rejection on an unkeyed `commit` | unkeyed `commit` | `retry` ONLY if the signal is declared `rejected_before_execution: true` in config, bounded by `safe_reject_redispatch`; else `reconcile` | a fresh dispatch is safe only when the provider verifiably rejects before any side effect; such rejections do not consume the exactly-once attempt (§2.4) |
+| 5 | Rate limit or documented safe rejection on an unkeyed `commit` | unkeyed `commit` | `retry` ONLY if the signal is declared `no_side_effect: true` in config, bounded by `safe_reject_redispatch`; else `reconcile` | a fresh dispatch is safe only when the provider verifiably left no side effect; such rejections do not consume the exactly-once attempt (§2.4) |
 | 6 | Transport fault (5xx, timeout, conn reset) | `read` / `mint` / keyed `commit` | `retry` | safe to repeat |
 | 7 | Transport fault (timeout, conn drop, ambiguous 5xx) | unkeyed `commit` | `reconcile` | may have landed (P3) |
 | 8 | Provider "terms changed" (price, schedule) | per config | `gate(consent)` | user decision, not failure |
@@ -486,14 +619,20 @@ Rules:
   consciously left to rows 11–12 (list them in a `known_unmatched` note).
 - Rows 11–12 are fixed. A config may not route unmatched signals to `retry`,
   `repair`, or a model decision.
-- A signal may be declared `rejected_before_execution: true` only on
-  provider-verified evidence that the rejection occurs before any side effect
-  (e.g. an edge rate limiter, or an error the provider documents as
-  "no booking/charge was created"). Only such signals ever permit a fresh
-  dispatch of an unkeyed commit — bounded by
+- A signal may be declared `no_side_effect: true` (v0.3 name:
+  `rejected_before_execution`, accepted as an alias) only on
+  provider-verified evidence that the failure left no side effect — an edge
+  rate limiter's 429, or an error the provider documents as "no
+  booking/charge was created". Only such signals ever permit a fresh dispatch
+  of an unkeyed commit — bounded by
   `policy.per_step.commit.unkeyed.safe_reject_redispatch`, and without
   consuming the single uncertain-dispatch attempt (§2.4) — every other
   signal on an unkeyed commit is ambiguous-or-terminal, never retried.
+- When a provider reuses one machine-readable error id across causes and the
+  discriminator is prose (`errors[].message` text), matchers MAY match on
+  message content but the row must be marked `fragile: prose-match` and a
+  `known_unmatched` fallback kept — message text is not a contract and can
+  change without notice.
 - **Unattributable staleness.** When a staleness signal cannot be attributed
   to a specific handle (a bare `http:410` with no error code on a step
   consuming several expiring handles), rewind to the refresh target of the
@@ -1098,6 +1237,24 @@ Open questions:
 
 ## Changelog
 
+- **v0.4 (2026-07-28)** — the cross-provider agenda from the Duffel / Stripe /
+  Travelport / Booking.com blind compiles, plus one item paid for in
+  production (a real double-booking vector found by the Booking.com
+  compile-vs-production comparison and since fixed):
+  `output.business_expiry` (landed commits whose usefulness expires at a
+  provider-returned deadline — held bookings); probe-input rule
+  (confirmation probes must run without the commit's own output);
+  `revocation` watch (landed-but-revocable commits: async refund failure,
+  airline-initiated changes); `idempotency.key_retention` +
+  `replay_semantics` (keys expire ~24h → effectively unkeyed; replays serve
+  cached errors); `empty.detect` ranges over the full response (declines on
+  error transports); `rejected_before_execution` generalized to
+  `no_side_effect` (alias kept); wall_clock excludes reconciling-awaiting-
+  async; `staleness.contractual` TTL flag; client-held pseudo-lineage
+  sanctioned; compensation `ladder` (condition-tiered unwind);
+  `probe_only` actions; prose-match fragility rule; §2.7 Variants (GDS/NDC
+  rails, per-vertical regimes); §2.8 caller `run_key` (run creation is a
+  commit too); gate `payload_expiry`.
 - **v0.3.2 (2026-07-27)** — cross-provider (Duffel + Stripe public-docs
   compile) fixes: resolved the §3-row-5 vs §2.4 contradiction — unkeyed
   `attempts: 1` counts UNCERTAIN dispatches; provider-documented
