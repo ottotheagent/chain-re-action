@@ -47,6 +47,11 @@ and this repo is meant to save you the incidents we learned them from.
   replay produces one booking, provider-reported expiry forces re-price,
   budget exhaustion emits dead-end with full trace, …). This is the
   acceptance test suite for a runtime and the honesty check for the repo.
+- `compiles/` — four real blind-compile artifacts against public APIs
+  (Duffel, Stripe, Travelport, Booking.com Demand), unedited, plus
+  [`RESULTS.md`](compiles/RESULTS.md) — what each run found, including the
+  production double-booking vector one of them caught. Use them to
+  calibrate what a compile of your own API should look like.
 
 The runtime implementation is intentionally out of scope; the spec is
 language-agnostic and written to be implemented from.
@@ -119,7 +124,9 @@ overkill (single call, fully idempotent CRUD, provider already runs the state
 machine) — if it says "use a retry wrapper," believe it.
 
 The spec is tested through blind-compile verification: an agent seeing only
-SPEC+SKILL and a target API's documentation compiles a chain config, which is
-then compared dimension-by-dimension against Otto's production implementation
-of the same chain. Those verification artifacts cite production internals and
-are kept out of this public repo (gitignored).
+SPEC+SKILL and a target API's documentation compiles a chain config, scored
+on safety-core reproduction and UNKNOWN discipline — and, where we operate a
+production integration of the same chain, compared against it
+dimension-by-dimension. Four public-API compiles are published in
+`compiles/` with a results write-up; the production-comparison artifacts
+cite internals and are kept out of this public repo (gitignored).
