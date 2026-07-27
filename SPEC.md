@@ -2,7 +2,7 @@
 
 Created: 2026-07-27
 Last Updated: 2026-07-27
-Status: Draft v0.3.1 (pre-implementation)
+Status: Draft v0.3.2 (pre-implementation)
 
 A domain-agnostic model for multi-step API chains where later steps mutate
 external state, intermediate results expire, and "nothing available" is a valid
@@ -331,7 +331,16 @@ policy:
     mint:    {attempts: 2, backoff: {base: 1s, factor: 2, jitter: full, max: 10s}}
     commit:
       keyed:   {attempts: 3, backoff: {base: 2s, factor: 2, jitter: full, max: 30s}}
-      unkeyed: {attempts: 1}      # NON-NEGOTIABLE for idempotency.mode=none
+      unkeyed:
+        attempts: 1               # counts UNCERTAIN dispatches — NON-NEGOTIABLE
+                                  # for idempotency.mode=none
+        safe_reject_redispatch: 2 # additional dispatches permitted ONLY after
+                                  # signals declared rejected_before_execution
+                                  # (§3): a provider-documented no-side-effect
+                                  # rejection did not consume the exactly-once
+                                  # attempt, so re-dispatching does not violate
+                                  # it. Anything without that guarantee still
+                                  # consumes the single attempt.
     compensate: <same shape as commit>
   per_chain:
     max_rewinds: int              # total rewind+repair+reselect budget for the run
@@ -463,7 +472,7 @@ by deterministic code. The generic skeleton every domain table starts from:
 | 2 | Transport success + `empty.detect` true | actions with `empty.valid` | `ok(empty)` → `empty.route` | empty is an answer (P4) |
 | 3 | Transport success — a FALLTHROUGH: matches only after the domain rows and rows 1–2 (all payload-level predicates) have failed to match | any | `ok` | a 200 carrying an expiry or error code must never reach this row |
 | 4 | Rate limit (`http:429`, provider throttle code) | `read` / `mint` / keyed `commit` | `retry` | transient by contract |
-| 5 | Rate limit on an unkeyed `commit` | unkeyed `commit` | `retry` ONLY if the signal is declared `rejected_before_execution: true` in config; else `reconcile` | a fresh dispatch is safe only when the provider verifiably rejects before any side effect |
+| 5 | Rate limit or documented safe rejection on an unkeyed `commit` | unkeyed `commit` | `retry` ONLY if the signal is declared `rejected_before_execution: true` in config, bounded by `safe_reject_redispatch`; else `reconcile` | a fresh dispatch is safe only when the provider verifiably rejects before any side effect; such rejections do not consume the exactly-once attempt (§2.4) |
 | 6 | Transport fault (5xx, timeout, conn reset) | `read` / `mint` / keyed `commit` | `retry` | safe to repeat |
 | 7 | Transport fault (timeout, conn drop, ambiguous 5xx) | unkeyed `commit` | `reconcile` | may have landed (P3) |
 | 8 | Provider "terms changed" (price, schedule) | per config | `gate(consent)` | user decision, not failure |
@@ -479,9 +488,12 @@ Rules:
   `repair`, or a model decision.
 - A signal may be declared `rejected_before_execution: true` only on
   provider-verified evidence that the rejection occurs before any side effect
-  (e.g. an edge rate limiter). Only such signals ever permit a fresh dispatch
-  of an unkeyed commit; every other signal on an unkeyed commit is
-  ambiguous-or-terminal, never retried.
+  (e.g. an edge rate limiter, or an error the provider documents as
+  "no booking/charge was created"). Only such signals ever permit a fresh
+  dispatch of an unkeyed commit — bounded by
+  `policy.per_step.commit.unkeyed.safe_reject_redispatch`, and without
+  consuming the single uncertain-dispatch attempt (§2.4) — every other
+  signal on an unkeyed commit is ambiguous-or-terminal, never retried.
 - **Unattributable staleness.** When a staleness signal cannot be attributed
   to a specific handle (a bare `http:410` with no error code on a step
   consuming several expiring handles), rewind to the refresh target of the
@@ -861,17 +873,23 @@ the durable run snapshot, not in prompt text.
 
 ---
 
-## 7. Worked example B — Card payment capture chain
+## 7. Worked example B — Card payment capture chain (Stripe-shaped)
+
+> **Provenance note.** Same rule as example A: illustrative, never evidence.
+> This version was re-derived from a blind compile against Stripe's public
+> documentation (2026-07) after the original draft was found to contain 11
+> material errors — the example itself is a case study in why the
+> `spec-example` rule exists.
 
 Chosen for a deliberately different failure shape: the provider **offers
-idempotency keys** (so ambiguous commit failures become `retry`, not
-`reconcile`), the reservation step (**authorization hold**) has a real
-compensator and a long self-expiry (~7 days), a mandatory user gate can occur
-mid-chain (3DS/SCA), and the most common "failure" — card declined — is a
-valid answer repairable at intent level.
+idempotency keys** (with a retention window — see the idempotency notes), a
+mandatory user gate can occur mid-chain (3DS/SCA), the reservation
+(**authorization hold**) expires by *canceling the whole payment intent*,
+and the most common "failure" — card declined — is a valid answer repairable
+at intent level, delivered on an error transport.
 
-Chain: `create_customer → authorize → [3DS gate] → capture`, compensators
-`release_hold` and `refund`.
+Chain: `create_customer → create_intent → confirm [entry-gated consent,
+SCA gate mid-chain] → capture`, compensators `cancel_intent` and `refund`.
 
 ### 7.1 Handles
 
@@ -881,21 +899,38 @@ handles:
     minted_by: create_customer
     derived_from: []
     staleness: {detect: [], ttl_hint: n/a, refresh: n/a}   # durable, not expiring
-  intent_id:                        # payment intent / authorization hold
-    minted_by: authorize
+  intent_id:                        # the payment-intent object (not yet a hold)
+    minted_by: create_intent
     derived_from: [customer_id]
-    staleness: {detect: [code:authorization_expired], ttl_hint: ~7d, refresh: authorize}
-  client_challenge:                 # 3DS challenge session, short-lived
-    minted_by: authorize            # emitted only when SCA required
+    staleness: {detect: [code:payment_intent_unexpected_state], ttl_hint: unknown,
+                refresh: create_intent}
+  hold:                             # the authorization, established by confirm
+    minted_by: confirm
     derived_from: [intent_id]
-    staleness: {detect: [code:challenge_expired], ttl_hint: ~15m, refresh: authorize}
+    staleness:
+      detect: [code:charge_expired_for_capture,   # on capture attempt
+               webhook:charge.expired]            # out-of-band expiry event
+      ttl_hint: per-payment         # read charge.capture_before — windows vary
+                                    # ~2d (card-present MC/Amex/Discover) to
+                                    # ~30d (extended auth); never assume a
+                                    # flat "7 days"
+      refresh: create_intent        # expiry CANCELS the intent terminally —
+                                    # the rewind target is intent CREATION,
+                                    # not re-confirm; confirm's entry_gate
+                                    # re-consents on the replay
   charge_id:
     minted_by: capture
-    derived_from: [intent_id]
+    derived_from: [hold]
     staleness: {detect: [], ttl_hint: n/a, refresh: n/a}
 ```
 
 ### 7.2 Actions
+
+Idempotency notes that govern every keyed row below: keys are retained
+~24h — beyond retention a "keyed" action is effectively unkeyed (never
+re-dispatch an old key; probe instead), and key replay returns the CACHED
+response including cached errors (a replayed 500 is not a re-execution) —
+both are why `reconcile` stays load-bearing even on a keyed provider.
 
 ```yaml
 actions:
@@ -903,93 +938,123 @@ actions:
     effect: commit                  # durable record, but keyed → retry-safe
     input: {intent: {email: string, name: string}}
     output: {payload: customer, handles: [customer_id]}
-    idempotency: {mode: keyed, key_scope: intent}   # same email+name dedupes across runs
-    confirmation: {by_key_replay: {note: "keyed synchronous: replaying the
-                   intent-scoped key returns the existing customer"}}
+    idempotency: {mode: keyed, key_scope: intent}
+                                    # same email+name dedupes across runs ONLY
+                                    # within key retention (~24h); durable
+                                    # cross-run dedup needs a search-by-email
+                                    # probe, not the key
+    confirmation: {by_key_replay: {note: "keyed synchronous, within retention:
+                   replaying the intent-scoped key returns the existing customer"}}
     compensation: {action: none, ordering_note: "orphan customer records are harmless; GC out of band"}
 
-  - id: authorize                   # places a HOLD, not a charge — but a hold
-    effect: commit                  # ties up the customer's credit limit for
-                                    # days and a second call creates a second
-                                    # consequential hold: by the §2.1 rubric
-                                    # this is a COMMIT even though it
-                                    # self-expires (mint = inconsequential, not
-                                    # merely short-lived). Keyed → ambiguous
-                                    # failures retry safely on the same key.
-    input: {intent: {amount: money, instrument: payment_method_ref},
+  - id: create_intent               # mint: creates the intent OBJECT only —
+    effect: mint                    # no hold, no user-visible consequence
+                                    # until confirm; abandoned intents are
+                                    # inert (auto-expire server-side)
+    input: {intent: {amount: money, capture_method: manual},
             handles: [customer_id]}
-    output:
-      payload: {status: enum[requires_capture, requires_action, declined], decline_code: string?}
-      handles: [intent_id, client_challenge?]
-      empty: {valid: true, detect: "status == 'declined'",
-              route: repair(to: authorize, fields: [instrument])}   # decline = answer, not error (P4)
+    output: {payload: intent, handles: [intent_id]}
     idempotency: {mode: keyed, key_scope: run}
-    confirmation: {by_key_replay: {note: "keyed synchronous: replaying the run-scoped
-                   key returns the original intent + hold status"}}
-    compensation:
-      action: release_hold
-      window: "any time before capture; hold self-expires ~7d anyway"
 
-  - id: capture                     # the commit
-    effect: commit
-    input: {handles: [intent_id], intent: {amount: money}}   # partial capture allowed
+  - id: confirm                     # THE HOLD: ties up the customer's credit
+    effect: commit                  # for days and a second confirm on a fresh
+                                    # intent creates a second consequential
+                                    # hold — §2.1 rubric: commit, not mint.
+                                    # Keyed → ambiguous failure retries the
+                                    # SAME key (within retention).
+    entry_gate: payment_consent     # re-fires on every arrival — incl. the
+                                    # replay after a hold-expiry rewind
+    input: {intent: {instrument: payment_method_ref}, handles: [intent_id]}
+    output: {payload: {status: enum[requires_capture, requires_action]},
+             handles: [hold]}
+    idempotency: {mode: keyed, key_scope: run}
+    confirmation: {by_key_replay: {note: "keyed synchronous within retention;
+                   beyond retention probe get_intent by intent_id"}}
+    compensation:
+      action: cancel_intent
+      window: "any time before capture; the hold also self-expires (capture_before)"
+
+  - id: capture                     # in-place commit on the intent (mutates),
+    effect: commit                  # mints the charge as its durable output
+    mutates: hold
+    input: {handles: [hold], intent: {amount: money}}
+                                    # partial capture allowed: amount ≤
+                                    # authorized; the uncaptured remainder is
+                                    # RELEASED (single capture only)
     output: {payload: charge, handles: [charge_id]}
-    idempotency: {mode: keyed, key_scope: run}   # keys exist → ambiguous
-                                                 # failure = retry SAME key,
-                                                 # reconcile rarely needed
-    confirmation:                    # still declared: finality is webhook-async
+    idempotency: {mode: keyed, key_scope: run}
+    confirmation:                    # content-based (mutates): status, not existence
       probe: get_intent
-      signal: "intent.status == 'succeeded'"
+      signal: "intent.status == 'succeeded' && charge.amount_captured == amount"
       async: {channel: webhook, deadline: 24h}
     compensation:
       action: refund
-      window: "refund any time; funds settle T+2, refund before settlement ≈ void"
 
-  - id: release_hold
+  - id: cancel_intent
     effect: compensate
     input: {handles: [intent_id]}
-    idempotency: {mode: natural}     # releasing a released hold: no-op
+    idempotency: {mode: keyed, key_scope: run}
+                                    # NOT naturally idempotent: canceling an
+                                    # already-canceled intent errors — key
+                                    # replay is what makes retry safe
     confirmation: {probe: get_intent, signal: "intent.status == 'canceled'"}
 
-  - id: refund
-    effect: compensate
+  - id: refund                      # landed-but-revocable: creation succeeding
+    effect: compensate              # is NOT finality — a refund can FAIL
+                                    # asynchronously up to ~30 days later
+                                    # (refund.failed + failure_balance_
+                                    # transaction); the async deadline and
+                                    # sweep below carry that watch
     input: {handles: [charge_id], intent: {amount: money}}
     idempotency: {mode: keyed, key_scope: run}
-    confirmation: {probe: get_refund, signal: "status == 'succeeded'",
-                   async: {channel: webhook, deadline: 72h}}
+    confirmation:
+      probe: get_refund
+      signal: "refund.status == 'succeeded'"
+      async: {channel: webhook, deadline: 72h}
+      sweep: {interval: 72h, escalate_after: 30d}   # refund.failed → operator
+                                                    # picks an alternate remedy
 ```
 
 ### 7.3 Verdict table (domain rows)
 
 | # | Signal | Step scope | Verdict |
 |---|---|---|---|
-| P1 | `status == declined` + decline_code | authorize | `ok(empty)` → `repair(to: authorize, fields: [instrument])` |
-| P2 | `status == requires_action` | authorize | `gate(sca_challenge)` |
-| P3 | `code:challenge_expired` | capture (post-gate) | `rewind(to: authorize)` |
-| P4 | `code:authorization_expired` | capture | `rewind(to: authorize)` |
-| P5 | timeout / conn drop | capture | `retry` — SAME idempotency key makes this safe (contrast Spotnana D10) |
-| P6 | `code:insufficient_funds` at capture (auth ok, capture > auth or funds moved) | capture | `gate(amount_consent)` outcomes: capture auth'd amount → `repair(to: capture, fields: [amount])`; abort → `dead_end` |
-| P7 | fraud/risk block | authorize | `dead_end` |
+| P1 | `http:402` + `error.type == card_error` + decline_code | confirm | the domain's valid-empty, arriving on an ERROR transport — `repair(to: confirm, fields: [instrument])`: the intent returns to `requires_payment_method` and is deliberately reusable; replay CONFIRM with a new instrument, never re-create the intent |
+| P2 | `status == requires_action` | confirm | `gate(sca_challenge)` |
+| P3 | `code:payment_intent_authentication_failure` (3DS failed/expired) | confirm | `repair(to: confirm, fields: [instrument])` — same reusable-intent recovery as a decline |
+| P4 | `code:charge_expired_for_capture` / `webhook:charge.expired` | capture | `rewind(to: create_intent)` — expiry has CANCELED the intent terminally; confirm's entry_gate re-consents on the replay |
+| P5 | timeout / conn drop | confirm, capture | `retry` — SAME idempotency key, within retention; past retention → `reconcile` (probe get_intent), never a fresh key |
+| P6 | `code:amount_too_large` (capture > authorized) | capture | `dead_end` — deterministic reject; partial capture ≤ authorized is the only lever, a config/product decision, not a retry |
+| P7 | fraud/risk block (incl. `decline_code == generic_decline` masking stolen/lost/fraud) | confirm | `dead_end` — provider deliberately masks the true reason; do not route to instrument repair loops |
 | P8 | idempotency key conflict (replay with different params) | any keyed | `dead_end` — config bug, surface loudly |
+| P9 | `webhook:refund.failed` (post-success revocation, up to ~30d) | refund (async) | `escalate(operator)` — alternate remedy is a human decision; the charge remains captured |
 
 ```yaml
 gates:
+  payment_consent:                  # entry gate on confirm — re-fires on every
+    audience: user                  # arrival, incl. post-expiry replays
+    payload: {amount: money, instrument: payment_method_ref}
+    outcomes: {approve: ok, decline: dead_end}
+    timeout: {after: 30m, verdict: dead_end}
   sca_challenge:
     audience: user                  # user completes 3DS in their client
-    outcomes: {completed: ok, failed: repair(to: authorize, fields: [instrument]),
+    outcomes: {completed: ok, failed: repair(to: confirm, fields: [instrument]),
                abandoned: dead_end}
-    timeout: {after: 15m, verdict: dead_end}   # challenge session dies anyway
+    timeout: {after: 15m, verdict: dead_end}   # session TTL is undocumented at
+                                               # the API level — the timeout is
+                                               # a product choice, not a
+                                               # provider contract
 ```
 
 ### 7.4 Shape contrast vs example A (why generality holds)
 
 | Dimension | Spotnana air | Card payment |
 |---|---|---|
-| Idempotency on commit | none → attempts=1, `reconcile` path is load-bearing | keyed → ambiguous failure is plain `retry`; `reconcile` nearly vestigial |
-| Reservation step | mint handles are free garbage (self-expire, no cost) | hold ties up real credit → the reservation is itself a keyed COMMIT with a real compensator, not a mint |
-| Mid-chain user gate | price-change consent (exceptional path) | 3DS (routine path, must be designed for) |
-| "Nothing available" | empty search results | card declined (with machine-readable reason feeding the repair) |
-| Finality | webhook after commit + eventual-consistency probe | webhook after capture; probe is authoritative immediately |
+| Idempotency on commit | none → attempts=1, `reconcile` path is load-bearing | keyed → ambiguous failure is `retry` on the same key — but key retention (~24h) and cached-error replay keep `reconcile` load-bearing here too, just rarer |
+| Reservation step | mint handles are free garbage (self-expire, no cost) | hold ties up real credit → the reservation is itself a keyed COMMIT with a real compensator; its expiry kills the whole intent (rewind to creation) |
+| Mid-chain user gate | price-change consent (exceptional path) | 3DS (routine path, must be designed for) + entry-gated consent that re-fires on expiry replays |
+| "Nothing available" | empty search results (2xx, empty payload) | card declined — same valid-empty semantics, but delivered as an HTTP 402 error object with a machine-readable decline_code feeding the repair |
+| Finality | webhook after commit + eventual-consistency probe | probe authoritative immediately for capture; refunds are landed-but-revocable — creation succeeding is not finality (async failure up to ~30d) |
 
 The primitives don't change across the two; only the config does. That is the
 test of the abstraction.
@@ -1033,6 +1098,21 @@ Open questions:
 
 ## Changelog
 
+- **v0.3.2 (2026-07-27)** — cross-provider (Duffel + Stripe public-docs
+  compile) fixes: resolved the §3-row-5 vs §2.4 contradiction — unkeyed
+  `attempts: 1` counts UNCERTAIN dispatches; provider-documented
+  no-side-effect rejections (`rejected_before_execution`) don't consume it,
+  bounded by new `safe_reject_redispatch` (C1.8). Worked example B rewritten
+  against a blind compile of the real Stripe docs, fixing 11 material errors
+  in the original (declines are HTTP 402 error objects and the intent stays
+  reusable — repair replays confirm; hold expiry varies ~2d–30d by network
+  via `capture_before` and terminally cancels the intent — rewind targets
+  creation with entry-gated re-consent; fabricated error codes replaced with
+  real ones; capture overage is a deterministic `amount_too_large` dead end;
+  cancel is keyed, not naturally idempotent; refunds are landed-but-revocable
+  with ~30d async failure; key retention ~24h + cached-error replay keep
+  reconcile load-bearing on keyed providers; unsound cross-run key dedup
+  caveated).
 - **v0.3.1 (2026-07-27)** — round-4 blind-compile fixes: reconcile's
   not-landed branch may re-feed a probe-observed cause signal through the
   verdict table once (repair/gate/dead_end now reachable from reconcile —

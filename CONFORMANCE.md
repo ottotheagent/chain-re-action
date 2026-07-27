@@ -2,7 +2,7 @@
 
 Created: 2026-07-27
 Last Updated: 2026-07-27
-Applies to: SPEC.md v0.3.1
+Applies to: SPEC.md v0.3.2
 
 Behaviors ANY implementation of the spec must satisfy, independent of
 language or runtime shape (internal-rewind or external/planner-executed
@@ -43,6 +43,13 @@ values, not hard-code the spec's placeholder defaults. Trace assertions check
   past `async.deadline`. Assert: escalation to operator; run state
   `reconciling`; sweep re-probes until `escalate_after`; no auto-`dead_end`
   and no re-dispatch.
+- **C1.8 Safe rejects don't consume the exactly-once attempt.** Declare a
+  signal `rejected_before_execution: true` (provider-documented no-side-effect
+  rejection); emit it on an unkeyed commit. Assert: re-dispatch is permitted
+  up to `safe_reject_redispatch`; the single uncertain-dispatch attempt
+  remains available; any signal NOT so declared still consumes it
+  (reconcile/dead_end per the table); C1.1's exactly-one-dispatch-on-ambiguity
+  is preserved because a safe reject is not ambiguous.
 - **C1.7 Reconcile routes probe-observed causes.** Probe proves not-landed
   AND observes a classifiable cause (e.g. a payment-decline code). Assert:
   the cause signal is re-fed through the verdict table exactly once and may
