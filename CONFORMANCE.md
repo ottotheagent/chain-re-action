@@ -2,7 +2,7 @@
 
 Created: 2026-07-27
 Last Updated: 2026-07-27
-Applies to: SPEC.md v0.2.2
+Applies to: SPEC.md v0.3
 
 Behaviors ANY implementation of the spec must satisfy, independent of
 language or runtime shape (internal-rewind or external/planner-executed
@@ -63,6 +63,11 @@ values, not hard-code the spec's placeholder defaults. Trace assertions check
 - **C2.4 Spent means spent.** `single_use` handle consumed by an attempt with
   UNKNOWN outcome. Assert: the handle is marked spent; any replay re-mints it;
   the old value is never re-presented to the provider.
+- **C2.5 Unattributable staleness escalates deepest-first.** Emit a bare
+  staleness signal (no handle-identifying code) on a step consuming several
+  expiring handles. Assert: rewind targets the deepest (most recently minted)
+  candidate's refresh first; if the same signal recurs, the next-shallower
+  candidate is tried; each escalation consumes rewind budget.
 
 ## C3 — Invalidation and lineage
 
@@ -87,6 +92,11 @@ values, not hard-code the spec's placeholder defaults. Trace assertions check
   fresh selection is collected; the failed option is recorded as excluded and
   cannot be re-chosen; the selection pseudo-handle's descendants are
   invalidated.
+- **C3.6 Shared-handle death propagates across branches.** In a fan-out, let
+  branch A discover the shared read-prefix handle is stale. Assert: sibling
+  branches see it invalidated before any further use of it or its
+  descendants; the re-mint happens once and is re-shared; budgets decrement
+  per-run.
 
 ## C4 — Budgets and stop conditions
 
@@ -181,8 +191,15 @@ values, not hard-code the spec's placeholder defaults. Trace assertions check
   never silently swallowed; the run's final state names the uncompensated
   commit.
 - **C8.4 Explicit no-compensator commits are pre-gated.** For a commit with
-  `compensation: none` + `mutates`. Assert: the configured pre-commit consent
-  gate is unskippable on every path reaching that commit.
+  `compensation: none` + `mutates`, configured with an `entry_gate`. Assert:
+  the gate fires on EVERY path reaching that commit — including replays after
+  rewind/repair/reselect — and the run parks (state=at_gate) before any
+  dispatch each time.
+- **C8.5 Compensation sub-chains park correctly.** For a commit whose
+  `compensation.chain` includes a gate (e.g. refund-option choice). Assert:
+  during unwind the run parks in state=compensating at that gate; the gate's
+  timeout escalates to operator rather than silently abandoning the unwind;
+  the sub-chain's commit-class steps honor their own confirmations.
 
 ---
 

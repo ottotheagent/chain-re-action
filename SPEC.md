@@ -2,7 +2,7 @@
 
 Created: 2026-07-27
 Last Updated: 2026-07-27
-Status: Draft v0.2.2 (pre-implementation)
+Status: Draft v0.3 (pre-implementation)
 
 A domain-agnostic model for multi-step API chains where later steps mutate
 external state, intermediate results expire, and "nothing available" is a valid
@@ -92,7 +92,7 @@ action:
   id: string                      # unique within the chain
   description: string             # for humans and for the model's situational awareness
 
-  effect: read | mint | commit | compensate
+  effect: read | mint | commit | compensate | select
   # Classify by the DOUBLE-CALL TEST (what exists after calling twice) — never
   # by the endpoint's name, and never by whether the call returns a handle.
   # Reads may return handles to cached result state (a search_id) and remain
@@ -113,6 +113,12 @@ action:
   # compensate — business-level undo of a prior commit. Is itself
   #              commit-class: non-idempotent unless keyed, needs its own
   #              confirmation.
+  # select     — pseudo-step, no provider call: the model/user picks among a
+  #              results collection; the pick is recorded as a selection
+  #              pseudo-handle (I3) carrying a `rematch` spec. No idempotency,
+  #              no confirmation, no timeout, never retried. Re-established
+  #              after a rewind via rematch; a forced fresh pick is
+  #              `reselect`. Its input handles name the results it picks from.
 
   mutates: handle_id              # commit only, optional: this commit modifies
                                   # an existing durable object in place instead
@@ -145,8 +151,14 @@ action:
                                   # degraded (skip the dependent capability),
                                   # recorded in the trace
       reason: string
-  # Evaluated after ok, before advancing. Distinct from `empty`: the call
-  # succeeded and returned data — the data says the business action is blocked.
+  # Evaluated after ok, before advancing — on EVERY execution of the step,
+  # including replays after rewind/repair/reselect (stale consent or stale
+  # eligibility never carries over a replay). Distinct from `empty`: the call
+  # succeeded and returned data — the data says the business action is
+  # blocked. Also the home for response-COMPLETENESS assertions: a
+  # well-formed payload silently missing expected data (see
+  # `request_invariants`) is invisible to the verdict table unless a
+  # precondition asserts its presence.
 
   auto_repairs:                   # config-declared deterministic fallbacks
     - trigger: <signal or payload predicate>
@@ -186,10 +198,35 @@ action:
 
   compensation:                   # only meaningful for effect=commit
     action: action_id | none      # `none` must be explicit + justified in notes
+    chain: [action_id, ...]       # alternative to `action`: a compensation
+                                  # SUB-CHAIN (e.g. read refund options →
+                                  # gate picks one → commit-class cancel).
+                                  # Runs under the run's policy; its gates
+                                  # park the run in state=compensating; each
+                                  # commit-class step carries its own
+                                  # confirmation.
     window: <constraint>          # e.g. "within 24h of ticketing → void, no
                                   # penalty; after → refund w/ penalty"
     ordering_note: string         # e.g. "commit replacement BEFORE compensating
                                   # original" (never leave user with nothing)
+
+  entry_gate: gate_id             # optional: evaluated EVERY time the cursor
+                                  # reaches this action — including replays
+                                  # after rewind/repair/reselect — before any
+                                  # dispatch. The unskippable-by-construction
+                                  # home for pre-commit consent: the run parks
+                                  # even when a recovery path re-approaches
+                                  # the commit.
+
+  request_invariants:             # declared constants baked into every
+    <param>: value                # dispatch of this action — for parameters
+                                  # whose wrong value yields a well-formed but
+                                  # silently degraded response (invisible to
+                                  # any verdict row). Config-reviewed; never
+                                  # model- or runtime-varied. What is neither
+                                  # pinned here nor asserted by a
+                                  # completeness precondition is unprotected,
+                                  # by design.
 
   timeout: duration               # per-attempt wall clock
   latency_hint: duration          # expected p95, for planning only
@@ -349,7 +386,8 @@ decision without the original process.
 ```json
 // run snapshot (rewritten after every attempt; enables resume after restart)
 {
-  "run_id": "…", "chain_id": "…", "state": "at_gate|running|reconciling|done|dead_end",
+  "run_id": "…", "chain_id": "…",
+  "state": "at_gate|running|reconciling|compensating|done|dead_end",
   "cursor": "create_pnr",
   "intent": { … },                     // current, post-repairs
   "live_handles": {"search_id": {"alias": "…", "minted_at": "…", "spent": false}},
@@ -433,11 +471,24 @@ Rules:
   (e.g. an edge rate limiter). Only such signals ever permit a fresh dispatch
   of an unkeyed commit; every other signal on an unkeyed commit is
   ambiguous-or-terminal, never retried.
+- **Unattributable staleness.** When a staleness signal cannot be attributed
+  to a specific handle (a bare `http:410` with no error code on a step
+  consuming several expiring handles), rewind to the refresh target of the
+  DEEPEST (most recently minted) candidate first — the cheapest hypothesis.
+  If the same unattributed signal recurs after that re-mint, escalate to the
+  next-shallower candidate on each recurrence. `ttl_hint` and mint age may
+  order the candidates (planning, not enforcement — P2). Each escalation
+  consumes rewind budget as usual. ("Shallowest dead wins" in row 1 governs
+  the different case where multiple handles REPORT stale simultaneously.)
 - When multiple handles report stale in one signal, rewind to the refresh
   target of the **shallowest** (earliest-minted) dead handle; its re-mint
   invalidates the rest anyway (§4).
 
 ### Verdict → next-state transitions
+
+Cursor arrival at a step with an `entry_gate` parks at that gate first
+(state=at_gate) — on EVERY arrival, including replays after
+rewind/repair/reselect.
 
 ```
 ok           → evaluate `preconditions`; first match → its verdict; else
@@ -525,7 +576,11 @@ keyed by the full lineage that produced it, so branches cannot
 cross-contaminate — a return list coupled to branch A's outbound can never be
 read under branch B, even when the flights look near-identical (they differ
 in price). The join/comparison across branches happens in the planner, above
-this spec.
+this spec. When any branch discovers a SHARED read-prefix handle is stale,
+the shared store marks it dead for all runs: sibling branches treat it as
+invalidated at their next access (I1 then applies transitively within each
+run); the re-mint is performed once, by whichever run acts first, and
+re-shared. Budgets remain per-run.
 
 ---
 
@@ -628,6 +683,11 @@ actions:
               route: repair(to: search, fields: [dates, cabin, origin, destination])}
     idempotency: {mode: natural}
 
+  - id: select                     # selection pseudo-step: no API call (§2.1)
+    effect: select
+    input: {handles: [search_id]}  # picks one itinerary from the results
+    output: {handles: [selected_itinerary]}
+
   - id: coupled_return_search      # round-trip only. NOT a cross-join:
     effect: read                   # returns are priced against the selected
     input: {intent: {}, handles: [search_id, selected_itinerary]}   # outbound
@@ -682,9 +742,19 @@ actions:
                                                  # consistency (PNR queryable lag)
       sweep: {interval: 12h, escalate_after: 72h}  # stuck-PENDING records → operator
     compensation:
-      action: cancel_pnr
+      chain: [get_cancel_options, cancel_pnr]   # read options → gate picks
+                                                # option_id → commit-class cancel
       window: "within ~24h of ticketing → void (no penalty); after → refund per fare rules"
       ordering_note: "for replace-booking flows, commit the replacement BEFORE compensating the original"
+
+  - id: get_cancel_options         # first step of the compensation sub-chain
+    effect: read
+    input: {handles: [pnr_id]}
+    output: {payload: cancel_options[]}   # refund/credit breakdown per option
+    preconditions:
+      - {when: "cancel_options.length > 0",
+         verdict: gate(cancel_option_choice), reason: "user picks refund option"}
+    idempotency: {mode: natural}
 
   - id: cancel_pnr                 # compensator; itself commit-class
     effect: compensate
@@ -734,6 +804,13 @@ gates:
       choose_other:     {params: {seats: seat_selection}, bind: [seats],
                          verdict: repair(to: initiate_booking, fields: [seats])}
     timeout: {after: 15m, outcome: proceed_seatless}  # default: seatless
+  cancel_option_choice:            # fires inside the compensation sub-chain
+    audience: user                 # (state=compensating while parked)
+    payload: cancel_options[]
+    outcomes:
+      choose: {params: {option_id: string}, bind: [option_id], verdict: ok}
+    timeout: {after: 72h, verdict: dead_end}   # → escalate(operator): commit
+                                               # landed but unwind is stuck
 ```
 
 ### 6.4 What the invalidation graph buys (round-trip case)
@@ -933,6 +1010,18 @@ Open questions:
 
 ## Changelog
 
+- **v0.3 (2026-07-27)** — design pass on the twice-confirmed round-2/3
+  agenda: `effect: select` (selection pseudo-steps get a schema home);
+  `entry_gate` on actions (unskippable-by-construction pre-commit consent,
+  re-fires on every arrival including recovery replays) + preconditions
+  explicitly re-evaluate on replay; unattributable-staleness rule
+  (deepest-candidate-first escalation for bare signals on multi-handle
+  consumers); `request_invariants` + completeness-precondition boundary for
+  signal-less degradation; `compensation.chain` sub-chains with
+  state=compensating (example A's cancel flow now modeled honestly:
+  options read → choice gate → cancel commit); I7 cross-branch shared-handle
+  death propagation; SKILL multi-scope compile guidance; CONFORMANCE C2.5,
+  C3.6, C8.5 added, C8.4 rewritten against entry_gate.
 - **v0.2.3 (2026-07-27)** — round-3 blind-compile fixes: `reselect` added to
   the `empty.route` and `preconditions.verdict` enums (v0.2.2 used it in
   example A without extending the grammar); §6 provenance note + SKILL

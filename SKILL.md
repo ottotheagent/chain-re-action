@@ -152,6 +152,12 @@ For each step, emit the full Action record (SPEC §2.1). Non-negotiables:
   Self-expiry does not make a mint: if a repeated artifact is consequential
   to the user (a credit hold, a reservation that blocks inventory), it is a
   commit however short-lived.
+- Selection points compile as `effect: select` pseudo-steps: no dispatch,
+  input = the results handle they pick from, output = the selection
+  pseudo-handle (whose `rematch` spec comes from Q8b).
+- Pre-commit consent that must survive recovery replays (new price ⇒ new
+  consent) goes on the commit's `entry_gate`, not on a prior step's
+  precondition — entry gates re-fire on every arrival by construction.
 - Split inputs into `intent` (model-repairable) vs `handles` (code-owned).
   When in doubt, a field is a handle: the cost of wrongly letting the model
   repair a token is far higher than a round-trip to re-mint it.
@@ -223,7 +229,12 @@ snapshot and continuation runs decrement the same counters.
 
 ## Step 6 — Emit
 
-Produce ONE document with these sections, in order:
+Produce ONE document with these sections, in order. For multi-chain compiles
+(e.g. booking + round-trip + exchange for one provider): still one document —
+share the elicitation log and the verdict-table core; give each chain its own
+handle graph, actions, domain rows, gates, and walkthrough subsections; add a
+cross-chain notes section for shared handles and interactions (e.g. a
+booking's `pnr_id` feeding the exchange chain).
 
 1. **Chain summary** — the business outcome, the step list, one paragraph.
 2. **Fit-test verdict** — why a chain is the right abstraction here (which
