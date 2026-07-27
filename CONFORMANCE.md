@@ -2,7 +2,7 @@
 
 Created: 2026-07-27
 Last Updated: 2026-07-27
-Applies to: SPEC.md v0.3
+Applies to: SPEC.md v0.3.1
 
 Behaviors ANY implementation of the spec must satisfy, independent of
 language or runtime shape (internal-rewind or external/planner-executed
@@ -43,6 +43,11 @@ values, not hard-code the spec's placeholder defaults. Trace assertions check
   past `async.deadline`. Assert: escalation to operator; run state
   `reconciling`; sweep re-probes until `escalate_after`; no auto-`dead_end`
   and no re-dispatch.
+- **C1.7 Reconcile routes probe-observed causes.** Probe proves not-landed
+  AND observes a classifiable cause (e.g. a payment-decline code). Assert:
+  the cause signal is re-fed through the verdict table exactly once and may
+  yield repair/gate/dead_end; it never yields a retry of the commit; a
+  second reconcile of the same attempt cannot re-feed again.
 
 ## C2 — Staleness and expiry
 
@@ -149,9 +154,10 @@ values, not hard-code the spec's placeholder defaults. Trace assertions check
   timeout verdict executes; precedence per-gate over per-chain default.
 - **C6.3 Outcome params bind only declared fields.** Answer a gate with
   params. Assert: values land in the outcome's `bind` intent fields only; an
-  answer attempting to set other fields (or a handle) is rejected; an
-  outcome's declared `set` assignments (e.g. `seats: null`) apply exactly as
-  configured before the verdict executes.
+  answer attempting to set other fields (or a handle) is rejected; an answer
+  naming an option absent from the gate's presented payload (a fabricated
+  `option_id`) is rejected; an outcome's declared `set` assignments (e.g.
+  `seats: null`) apply exactly as configured before the verdict executes.
 - **C6.4 `ok` outcome never re-executes the raising step.** Accept a gate
   raised by step S. Assert: the run advances past S using S's existing
   output; S's dispatch count is unchanged.

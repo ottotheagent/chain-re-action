@@ -51,8 +51,10 @@ Docs lie by omission; prefer empirical evidence, and record the source of
 each answer (`documented` / `observed` / `assumed`). A claim that appears
 ONLY in SPEC.md's worked examples — including when your target domain IS an
 example's domain — is tagged `spec-example`: never evidence; route its
-signals to `known_unmatched` until independently sourced. Ask, per candidate
-step:
+signals to `known_unmatched` until independently sourced. When the corpus is
+itself an empirical-notes document, tag restated API shapes (endpoints,
+fields, enums) as `documented` and behavioral claims (TTLs, timing, failure
+behavior) as `observed`. Ask, per candidate step:
 
 **Effect classification**
 1. If this call runs twice with the same inputs, what exists afterwards?
@@ -127,9 +129,12 @@ step:
 
 ## Step 2 — Build the handle graph
 
-- One `handle` entry per token, plus a **pseudo-handle for every model/user
-  selection** among returned options (SPEC I3) — selections are derivations
-  and drive invalidation exactly like tokens.
+- One `handle` entry per token, plus a **pseudo-handle for every selection
+  that downstream results couple to** (SPEC I3) — the pick needs
+  `derived_from` edges (an itinerary choice that returns/seat maps derive
+  from); such selections are derivations and drive invalidation exactly like
+  tokens. A pick that is merely a request parameter with no derived lineage
+  (a seat preference) is an intent field, not a pseudo-step.
 - Draw `derived_from` edges from Q8 answers. Then verify by contradiction:
   for each handle pair (A, B) with no edge, ask "if A is re-minted, is B
   really still valid?" Missing edges are the classic bug.
@@ -222,6 +227,9 @@ per_chain: {max_rewinds: 3, max_repairs: 2,
 Set `timeout` per step from Q14 worst-case, not average. The slowest step is
 usually the commit; give it headroom rather than letting a tight timeout
 manufacture ambiguous outcomes.
+
+`wall_clock` covers active execution including reconcile probes and
+compensation sub-chains; time parked at gates is excluded (SPEC §2.4).
 
 Budgets are config, enforced by code — never prompt text. If the executor is
 a planner loop (external mode, SPEC §2.3), budgets ride in the durable run

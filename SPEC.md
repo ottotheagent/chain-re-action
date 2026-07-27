@@ -2,7 +2,7 @@
 
 Created: 2026-07-27
 Last Updated: 2026-07-27
-Status: Draft v0.3 (pre-implementation)
+Status: Draft v0.3.1 (pre-implementation)
 
 A domain-agnostic model for multi-step API chains where later steps mutate
 external state, intermediate results expire, and "nothing available" is a valid
@@ -119,6 +119,11 @@ action:
   #              no confirmation, no timeout, never retried. Re-established
   #              after a rewind via rematch; a forced fresh pick is
   #              `reselect`. Its input handles name the results it picks from.
+  #              Only for picks that downstream results COUPLE to (the pick
+  #              needs derived_from edges — an itinerary choice that returns
+  #              and seat maps derive from). A pick that is merely a request
+  #              parameter with no derived lineage (a seat preference) is an
+  #              intent field, not a pseudo-step.
 
   mutates: handle_id              # commit only, optional: this commit modifies
                                   # an existing durable object in place instead
@@ -285,7 +290,7 @@ Exactly one verdict per attempt. Produced by the deterministic classifier
 | `repair(to: action_id, fields: [...])` | Rewind that additionally requires a proposed change to named *intent* fields (new date, other payment instrument). `fields` is never empty — a repair with nothing to repair is not a repair (use `reselect`). The proposal comes from model, user, or a config-declared `auto_repair` (`proposal_source: code`); the rewind mechanics stay code-owned. | model/user/config propose, code executes |
 | `reselect(to: selection_step)` | The chosen option is gone or was rejected (fare bucket sold out, option no longer offered) while its source results may still be live. Forces a FRESH selection at the named selection pseudo-step: `rematch` is bypassed, the failed option is recorded as excluded, downstream re-derives. | model/user select, code executes |
 | `gate(id)` | Pause for an external decision (consent, challenge, approval). Resumes with one of the gate's declared outcomes. | user/operator |
-| `reconcile` | Outcome unknown (lost response on a commit). Run the action's confirmation probe procedure. Resolves to `ok`, `rewind`, `dead_end`, or `escalate(operator)` on deadline. | code |
+| `reconcile` | Outcome unknown (lost response on a commit). Run the action's confirmation probe procedure. Resolves to `ok`, `rewind`, `repair`/`gate` (when the probe observes a classifiable cause — see transitions), `dead_end`, or `escalate(operator)` on deadline. | code |
 | `dead_end(reason)` | Terminal for this run. Provider rejected deterministically, or budgets exhausted. `reason` is machine-readable and carries `permanent: bool` plus optional `retry_after_hint` — an airline-control hold or in-progress ticketing is a *temporal* dead end the planner may re-attempt as a NEW run hours later; a fraud decline is permanent. Report; run compensation per config if partial commits exist. | code |
 
 Notes:
@@ -432,7 +437,13 @@ gate:
 An outcome with `params` is how a gate answer feeds the chain: the user's
 choice (a cancellation option, an alternate seat) binds into intent fields
 and typically rides a `repair`. `outcome_name: verdict` is a valid shorthand
-when there are no params.
+when there are no params. Param values are VALIDATED against the gate's
+presented payload: an answer naming an option that was not shown (an
+`option_id` absent from the presented list) is rejected like any other
+invalid proposal. Provider-minted identifiers that enter intent this way are
+legitimately intent, not handles — a human chose them from a validated set;
+this is the one sanctioned path for an opaque provider value to cross into
+intent.
 
 An outcome verdict of `ok` means the raising step's original success path
 stands: the run advances past the step that raised the gate, using that
@@ -520,7 +531,13 @@ gate(id)     → park run (state=at_gate); resume with a declared outcome
 reconcile    → mark correlation record RECONCILING; run confirmation probe
                (probe follows read policy; results matched via the record):
                landed   → treat original attempt as ok, advance
-               not-landed → rewind(refresh of consumed handle) if budget, else dead_end
+               not-landed, probe observed a classifiable cause signal (e.g. a
+                 decline code) → re-feed that signal through the verdict
+                 table ONCE — it may yield repair/gate/dead_end, never a
+                 retry of the commit; a second reconcile of the same attempt
+                 may not re-feed again
+               not-landed, no cause observed → rewind(refresh of consumed
+                 handle) if budget, else dead_end
                still unknown at async.deadline → escalate(operator),
                state=reconciling; `sweep` keeps re-probing until escalate_after
 dead_end     → if commits_landed non-empty → execute compensators in
@@ -547,7 +564,8 @@ pricing and MUST be structurally impossible: run state keys collections by
 the lineage of the handles that produced them.
 
 **I3 — Selection is derivation.** When the model/user selects among returned
-options, the selection is recorded as a derived pseudo-handle
+options AND downstream results couple to that choice, the selection is
+recorded as a derived pseudo-handle
 (`selected_outbound`, derived_from: [search_id]). Downstream results coupled
 to a selection (coupled return search, seat map for an itinerary) declare it
 in `derived_from`, so changing the selection invalidates them via I1. On
@@ -580,7 +598,10 @@ this spec. When any branch discovers a SHARED read-prefix handle is stale,
 the shared store marks it dead for all runs: sibling branches treat it as
 invalidated at their next access (I1 then applies transitively within each
 run); the re-mint is performed once, by whichever run acts first, and
-re-shared. Budgets remain per-run.
+re-shared. Budgets remain per-run. Branches need no graduation step: each
+branch is already a complete run, so the "winner" simply proceeds past the
+shared prefix under its own budgets and trace while the planner terminates
+the losers (their traces close as abandoned).
 
 ---
 
@@ -980,7 +1001,9 @@ test of the abstraction.
 Non-goals (v0.2): DAG/parallel step execution inside one run (fan-out =
 multiple runs sharing a read prefix, with lineage keying per I7; the
 comparison/join happens in the planner above this spec); cross-chain
-distributed transactions; provider rate-limit budgeting across concurrent
+distributed transactions; cross-run serialization on a shared durable object
+(an exchange racing a cancellation on one PNR — deployment-level per-object
+locking, outside this spec); provider rate-limit budgeting across concurrent
 runs; streaming/partial results.
 
 Open questions:
@@ -1010,6 +1033,17 @@ Open questions:
 
 ## Changelog
 
+- **v0.3.1 (2026-07-27)** — round-4 blind-compile fixes: reconcile's
+  not-landed branch may re-feed a probe-observed cause signal through the
+  verdict table once (repair/gate/dead_end now reachable from reconcile —
+  never a commit retry); gate `params` validated against the presented
+  payload, with the stated carve-out that gate-validated opaque choices are
+  intent, not handles; selection-granularity rule (pseudo-step iff downstream
+  results couple to the pick; otherwise intent field) applied to §2.1/I3/
+  SKILL; `documented`-vs-`observed` tag convention for empirical-notes
+  corpora; I7 branch "graduation" answered (winner is already a full run);
+  cross-run serialization declared a non-goal; wall_clock scope note;
+  CONFORMANCE C1.7 added, C6.3 extended.
 - **v0.3 (2026-07-27)** — design pass on the twice-confirmed round-2/3
   agenda: `effect: select` (selection pseudo-steps get a schema home);
   `entry_gate` on actions (unskippable-by-construction pre-commit consent,
